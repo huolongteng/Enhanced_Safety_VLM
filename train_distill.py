@@ -170,8 +170,8 @@ if __name__ == '__main__':
         # 每次得到loss，累积梯度推理
     
         # Load optimizer.
-        optimizer = torch.optim.AdamW(student_model.parameters(), lr=1e-5)
-        optimizer.zero_grad()
+        # optimizer = torch.optim.AdamW(student_model.parameters(), lr=1e-5)
+        # optimizer.zero_grad()
         # loss.backward()
         # optimizer.step()
     # **********
