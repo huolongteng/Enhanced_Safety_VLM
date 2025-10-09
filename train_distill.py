@@ -1,6 +1,8 @@
 # Import all needed packages.
 from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 from PIL import Image
+from pathlib import Path
+import argparse
 import torch
 import torch.nn.functional as F
 
@@ -104,7 +106,8 @@ def load_model_and_processor(teacher_path, student_path):
     return T_, S_, P_
 
 def generate_model_inputs(image_path, processor):
-    image = Image.open(image_path)
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
     conversation = [
         {
             "role": "user",
@@ -119,9 +122,25 @@ def generate_model_inputs(image_path, processor):
     return inputs
 
 
-def cal_kl_loss(inputs, teacher_model, student_model, T):
-    # Move inputs to cuda. Could be deleted later.
-    inputs = {k: v.to('cuda') for k, v in inputs.items()}
+def build_image_list(image_dir, allowed_extensions=(".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+    image_dir = Path(image_dir)
+    if not image_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+
+    image_paths = sorted(
+        path for path in image_dir.iterdir()
+        if path.suffix.lower() in allowed_extensions and path.is_file()
+    )
+
+    if not image_paths:
+        raise ValueError(f"No images with extensions {allowed_extensions} found in {image_dir}")
+
+    return image_paths
+
+
+def cal_kl_loss(inputs, teacher_model, student_model, T, device):
+    # Move inputs to the computation device.
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
     # 教师模型前向传播，得到logits.
     with torch.no_grad():
@@ -134,47 +153,70 @@ def cal_kl_loss(inputs, teacher_model, student_model, T):
 
     # Delete middle Vs.
     del student_outputs, inputs, teacher_outputs
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     teacher_probs = (teacher_logits / T).softmax(dim=-1)
     student_probs = (student_logits / T).log_softmax(dim=-1)
     
     loss = F.kl_div(student_probs, teacher_probs, reduction='none') * (T * T)
     
-    del student_probs, teacher_probs, teacher_logits, student_logits
-    torch.cuda.empty_cache()
-    
-    return loss
-    
-if __name__ == '__main__':
-    teacher_model_path = "AIML-TUDA/LlavaGuard-v1.2-0.5B-OV-hf"
-    student_model_path = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
+    loss = loss.mean()
 
-    teacher_model, student_model, processor = load_model_and_processor(teacher_model_path, student_model_path)
-    # 指定教师模型和学生模型的模式
+    del student_probs, teacher_probs, teacher_logits, student_logits
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return loss
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Distill Llava safety model")
+    parser.add_argument("--image_dir", required=True, help="Directory containing training images")
+    parser.add_argument("--teacher_model", default="AIML-TUDA/LlavaGuard-v1.2-0.5B-OV-hf")
+    parser.add_argument("--student_model", default="llava-hf/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--max_steps", type=int, default=None, help="Optional limit on number of steps for quick experiments")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    teacher_model, student_model, processor = load_model_and_processor(
+        args.teacher_model, args.student_model
+    )
     teacher_model.eval()
     student_model.train()
-    teacher_model.to("cuda")
-    student_model.to("cuda")
+    teacher_model.to(device)
+    student_model.to(device)
 
-    # 需要写多图像列表...
-    # **********
+    image_list = build_image_list(args.image_dir)
 
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.learning_rate)
 
-    
-    # **********
-    
-    # 假如文件夹里面的全部都是.jpg格式的图片，已经读取了列表image_list。
-    # **********
-    # for i in range(image_list):
-        # 每次得到loss，累积梯度推理
-    
-        # Load optimizer.
-        optimizer = torch.optim.AdamW(student_model.parameters(), lr=1e-5)
+    step = 0
+    optimizer.zero_grad()
+    for idx, image_path in enumerate(image_list, start=1):
+        if args.max_steps is not None and step >= args.max_steps:
+            break
+
+        inputs = generate_model_inputs(image_path, processor)
+        loss = cal_kl_loss(inputs, teacher_model, student_model, args.temperature, device)
+        loss.backward()
+        step += 1
+
+        if idx % args.grad_accum_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        print(f"Step {step}: loss={loss.item():.6f} (image: {image_path.name})")
+
+    # Flush remaining gradients if the total number of images is not a multiple of grad_accum_steps.
+    if step % args.grad_accum_steps != 0:
+        optimizer.step()
         optimizer.zero_grad()
-        # loss.backward()
-        # optimizer.step()
-    # **********
+
+    print("Distillation finished. Total steps:", step)
 
 
 
