@@ -151,18 +151,18 @@ class PolicyImageDataset(Dataset):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert("RGB")
         image = self.transform(image)
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": policy},
-                ],
-            },
-        ]
-        text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=False)
-        inputs = self.processor(text=text_prompt, images=image, return_tensors="pt")
-        return inputs
+        return {
+            "image": image,
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": self.policy},
+                    ],
+                },
+            ],
+        }
 
 from torch.utils.data import DataLoader
 
