@@ -165,4 +165,14 @@ class PolicyImageDataset(Dataset):
         return inputs
 
 from torch.utils.data import DataLoader
-print('Yes, minister.')
+
+# This block is about defining Loss function.
+def load_model_and_processor(teacher_path, student_path):
+    t_ = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
+    s_ = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
+    p_ = AutoProcessor.from_pretrained(teacher_path)
+    return t_, s_, p_
+
+
+
+
