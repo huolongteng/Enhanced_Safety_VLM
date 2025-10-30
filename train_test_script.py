@@ -103,7 +103,7 @@ def count_jpg_in_folder(folder_name) -> int:
     print(f"Found {count} .jpg files in `{tmp_dir}`.")
     return count
 
-from typing import List
+from typing import List, Optional
 
 
 def get_dirs_with_jpg(base_folder_name: str = "tmp") -> List[str]:
@@ -167,11 +167,87 @@ class PolicyImageDataset(Dataset):
 from torch.utils.data import DataLoader
 
 # This block is about defining Loss function.
+import torch
+import torch.nn.functional as F
+
 def load_model_and_processor(teacher_path, student_path):
     t_ = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
     s_ = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
     p_ = AutoProcessor.from_pretrained(teacher_path)
+    t_.config.sliding_window = None
+    s_.config.sliding_window = None
     return t_, s_, p_
+
+def _move_batch_to_device(batch, device):
+    """Move every tensor in ``batch`` to ``device``."""
+    if device is None:
+        return batch
+
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in batch.items()
+    }
+
+
+def forward_teacher_student(
+    teacher_model,
+    student_model,
+    batch,
+    device,
+):
+    """Run a forward pass for both teacher and student on ``batch``.
+    """
+    model_inputs = _move_batch_to_device(batch, device)
+
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**model_inputs)
+
+    student_outputs = student_model(**model_inputs)
+    return teacher_outputs, student_outputs, model_inputs
+
+def compute_kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+):
+    """Compute the standard KL-divergence loss for knowledge distillation."""
+
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+    kd = F.kl_div(student_log_probs, teacher_probs, reduction="none")
+
+    if attention_mask is not None:
+        mask = attention_mask.unsqueeze(-1).expand_as(kd)
+        kd = (kd * mask).sum() / mask.sum().clamp_min(1.0)
+    else:
+        kd = kd.mean()
+
+    return kd * (temperature**2)
+
+
+# Test.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+folder_name = "tmp"
+count_jpg_in_folder(folder_name)
+image_paths = get_dirs_with_jpg(folder_name)
+processor = AutoProcessor.from_pretrained("E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
+dataset = PolicyImageDataset(image_paths, processor, policy)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+dataloader_ = iter(dataloader)
+batch = next(dataloader_)
+
+teacher_model, student_model, processor = load_model_and_processor(
+        "E:\models\LlavaGuard-v1.2-0.5B-OV-hf", "E:\models\llava-onevision-qwen2-0.5b-ov-hf"
+    )
+teacher_model.eval()
+student_model.train()
+teacher_model.to(device)
+student_model.to(device)
+
+# t_o, s_o, m_i = forward_teacher_student(teacher_model, student_model, batch, device)
+print(1)
 
 
 
