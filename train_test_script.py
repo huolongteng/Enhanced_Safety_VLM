@@ -337,12 +337,15 @@ def compute_alignment_stats(
     }
 
 # This block is about training process.
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
 def distillation_step(
     teacher_model: LlavaOnevisionForConditionalGeneration,
     student_model: LlavaOnevisionForConditionalGeneration,
     optimizer: torch.optim.Optimizer,
     batch,
-    device: Optional[torch.device] = None,
+    device,
     temperature: float = 1.0,
 ):
     """Perform a single optimization step using knowledge distillation."""
@@ -404,28 +407,111 @@ def run_distillation_epoch(
         "num_batches": num_batches,
     }
 
+# Set random seed.
+import random
+def same_seeds(seed=443):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+same_seeds(2025)
+
 # Test.
 device = "cuda" if torch.cuda.is_available() else "cpu"
 folder_name = "tmp"
 count_jpg_in_folder(folder_name)
 image_paths = get_dirs_with_jpg(folder_name)
+
+image_paths = random.sample(image_paths, min(200, len(image_paths)))
+
 processor = AutoProcessor.from_pretrained("E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
 dataset = PolicyImageDataset(image_paths, policy)
-dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=build_policy_collate_fn(processor),)
-dataloader_ = iter(dataloader)
-batch = next(dataloader_)
+dataloader = DataLoader(
+    dataset,
+    batch_size=1,
+    shuffle=True,
+    collate_fn=build_policy_collate_fn(processor),
+)
 
 teacher_model, student_model, processor = load_model_and_processor(
         "E:\models\LlavaGuard-v1.2-0.5B-OV-hf", "E:\models\llava-onevision-qwen2-0.5b-ov-hf"
     )
 teacher_model.eval()
-student_model.train()
 teacher_model.to(device)
 student_model.to(device)
 
-t_o, s_o, m_i = forward_teacher_student(teacher_model, student_model, batch, device)
-diff_dict = compute_alignment_stats(s_o.logits, t_o.logits)
+optimizer = torch.optim.AdamW(student_model.parameters(), lr=5e-5)
+num_epochs = 10
+epoch_losses = []
+step_losses: List[float] = []
+global_step = 0
 
+for epoch in range(num_epochs):
+    student_model.train()
+    progress_bar = tqdm(
+        dataloader,
+        desc=f"Epoch {epoch + 1}/{num_epochs}",
+        leave=False,
+    )
+    running_loss = 0.0
+    num_batches = 0
+
+    for batch in progress_bar:
+        loss = distillation_step(
+            teacher_model,
+            student_model,
+            optimizer,
+            batch,
+            device=device,
+        )
+        running_loss += loss
+        num_batches += 1
+        global_step += 1
+        step_losses.append(loss)
+        progress_bar.set_postfix({
+            "loss": f"{loss:.4f}",
+            "step": global_step,
+        })
+
+    average_loss = running_loss / max(num_batches, 1)
+    epoch_losses.append(average_loss)
+    print(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
+
+epochs = range(1, num_epochs + 1)
+plt.figure(figsize=(8, 5))
+plt.plot(epochs, epoch_losses, marker="o", label="Epoch Avg Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Average Loss")
+plt.title("Knowledge Distillation Training Loss (Epoch)")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+epoch_plot_path = Path("loss_curve_epoch.png")
+plt.savefig(epoch_plot_path)
+plt.close()
+print(f"Saved epoch loss curve to {epoch_plot_path.resolve()}")
+
+if step_losses:
+    steps = range(1, len(step_losses) + 1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, step_losses, label="Step Loss")
+    plt.xlabel("Training Step")
+    plt.ylabel("Loss")
+    plt.title("Knowledge Distillation Training Loss (Step)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    step_plot_path = Path("loss_curve_step.png")
+    plt.savefig(step_plot_path)
+    plt.close()
+    print(f"Saved step loss curve to {step_plot_path.resolve()}")
+
+save_path = Path("student_model_state.pt")
+torch.save(student_model.state_dict(), save_path)
+print(f"Saved student model parameters to {save_path.resolve()}")
 
 
 
