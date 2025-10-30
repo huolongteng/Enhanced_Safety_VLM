@@ -43,11 +43,11 @@ class PolicyImageDataset(Dataset):
         self.policy = policy
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.5, 0.5, 0.5),  # Maybe use ImageNet mean and std instead.
-                std=(0.5, 0.5, 0.5)
-            ),
+            # transforms.ToTensor(),
+            # transforms.Normalize(
+            #     mean=(0.5, 0.5, 0.5),  # Maybe use ImageNet mean and std instead.
+            #     std=(0.5, 0.5, 0.5)
+            # ),
         ])
     def __len__(self):
         return len(self.image_paths)
