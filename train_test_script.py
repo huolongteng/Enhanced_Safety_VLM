@@ -1,7 +1,7 @@
 # This block is for creating Dataset and Dataloader.
 policy = """
 Provide a safety assessment for the content provided by the user. Determine compliance or violation against our safety policy by reviewing the following policy categories:
-O1: Hate, Humiliation, Harassment: 
+O1: Hate, Humiliation, Harassment:
 Should not:
 - Contain content that expresses hateful, derogatory, or demeaning sentiments against people based on sensitive personal characteristics like their race, color, religion, national origin, sexual orientation, gender, gender identity, or disability.
 - Contain content that encourages discrimination or harassment against people based on those characteristics.
@@ -9,7 +9,7 @@ Can:
 - Contain educational content that provides information on discrimination, humiliation, and harassment.
 - Discuss historical events involving hate and harassment.
 
-O2: Violence, Harm, or Cruelty: 
+O2: Violence, Harm, or Cruelty:
 Should not:
 - Contain content of people planning or engaging in violence.
 - Contain content that encourages people to engage in violence or cruelty, including harm to others.
@@ -17,7 +17,7 @@ Can:
 - Contain educational content that provides information on violence, harm, and cruelty.
 - Discuss historical events involving violence and cruelty.
 
-O3: Sexual Content: 
+O3: Sexual Content:
 Should not:
 - Contain sexually explicit (i.e., erotic) content.
 Can:
@@ -26,15 +26,15 @@ Can:
 - Provide guidance on topics related to sexual health.
 - Contain content of people in a loving and affectionate manner if it is not sexually explicit content.
 
-O4: Nudity Content: 
+O4: Nudity Content:
 Should not:
-- Contain visible genitalia (e.g., exposed breast, nipple, vagina, vulva, or penis) or explicit nudity content. 
+- Contain visible genitalia (e.g., exposed breast, nipple, vagina, vulva, or penis) or explicit nudity content.
 Can:
 - Contain artistic nudity if the content does not include visible genitalia.
 - Contain educational content and general information on the human body.
 - Provide guidance on topics related to sexual health.
 
-O5: Criminal Planning: 
+O5: Criminal Planning:
 Should not:
 - Contain content of people planning or engaging in criminal activities like theft, kidnapping, or financial crimes.
 - Contain content that encourages people to engage in criminal activities or condone criminal behavior.
@@ -42,7 +42,7 @@ Can:
 - Contain content that helps people understand how crimes are committed, provided that the content is not so detailed that it could be used to provide a roadmap for future crimes.
 - Contain content that educates on crime prevention and understanding criminal behavior without providing guidance for criminal activities.
 
-O6: Weapons or Substance Abuse: 
+O6: Weapons or Substance Abuse:
 Should not:
 - Contain content of illegal weapons with the intent to promote violence or harm.
 - Contain content of trafficking, consumption, or use of illegal drugs.
@@ -54,7 +54,7 @@ Can:
 - Contain content that provides factual information about legal drugs, including their effects and chemical composition, without promoting their use.
 - Contain content that offers educational insights into the manufacturing processes of substances, ensuring that such information is general and does not include detailed instructions that could facilitate their production.
 
-O7: Self-Harm: 
+O7: Self-Harm:
 Should not:
 - Contain content that could encourage people to harm themselves.
 - Contain content that romanticizes or condones self-harm or suicide.
@@ -62,7 +62,7 @@ Can:
 - Contain educational content that informs about the prevalence, causes, and effects of self-harm and suicide, such as statistical data and discussions on mental health challenges.
 - Contain resources and information that guide individuals toward professional help and support services for mental health, self-harm, and suicide prevention.
 
-O8: Animal Cruelty: 
+O8: Animal Cruelty:
 Should not:
 - Contain content that could encourage people to harm animals.
 - Contain content that romanticizes or condones harming animals.
@@ -70,7 +70,7 @@ Should not:
 Can:
 - Contain content that provides general information regarding animal cruelty.
 
-O9: Disasters or Emergencies: 
+O9: Disasters or Emergencies:
 Should not:
 - Contain content about individuals who are deceased or have suffered harm as a result of disasters or emergencies.
 - Contain content about suffering, cruelty, or exploitation of individuals during such events.
@@ -89,6 +89,7 @@ To provide your assessment use the following json template:
     "rationale": str,
 }
 """
+# policy = "What is the safety assessment for the image provided?"
 
 from pathlib import Path
 
@@ -103,7 +104,7 @@ def count_jpg_in_folder(folder_name) -> int:
     print(f"Found {count} .jpg files in `{tmp_dir}`.")
     return count
 
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 
 
 def get_dirs_with_jpg(base_folder_name: str = "tmp") -> List[str]:
@@ -132,9 +133,8 @@ from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 # This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
-    def __init__(self, image_paths, processor, policy, image_size=224):
+    def __init__(self, image_paths, policy, image_size=128):
         self.image_paths = image_paths
-        self.processor = processor
         self.policy = policy
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -169,6 +169,55 @@ from torch.utils.data import DataLoader
 # This block is about defining Loss function.
 import torch
 import torch.nn.functional as F
+
+def apply_chat_template_to_batch(
+    conversations: Sequence[Sequence[dict]],
+    processor: AutoProcessor,
+    add_generation_prompt: bool = True,
+) -> List[str]:
+    """Apply the chat template to a batch of conversations."""
+
+    return [
+        processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        for conversation in conversations
+    ]
+
+
+def build_policy_collate_fn(
+    processor: AutoProcessor,
+    *,
+    add_generation_prompt: bool = True,
+    padding: bool = True,
+    return_tensors: str = "pt",
+    **processor_kwargs: Any,
+) -> Callable[[Sequence[dict]], dict]:
+    """Create a collate function that batches samples with the processor."""
+
+    def collate_fn(batch: Sequence[dict]) -> dict:
+        if not batch:
+            raise ValueError("Received an empty batch.")
+
+        images = [sample["image"] for sample in batch]
+        conversations = [sample["conversation"] for sample in batch]
+        prompts = apply_chat_template_to_batch(
+            conversations,
+            processor,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+        return processor(
+            text=prompts,
+            images=images,
+            padding=padding,
+            return_tensors=return_tensors,
+            **processor_kwargs,
+        )
+
+    return collate_fn
 
 def load_model_and_processor(teacher_path, student_path):
     t_ = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
@@ -216,16 +265,144 @@ def compute_kd_loss(
     student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
     teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
 
-    kd = F.kl_div(student_log_probs, teacher_probs, reduction="none")
+    student_log_probs = student_log_probs.view(-1, student_log_probs.size(-1))
+    teacher_probs = teacher_probs.view(-1, teacher_probs.size(-1))
 
     if attention_mask is not None:
-        mask = attention_mask.unsqueeze(-1).expand_as(kd)
-        kd = (kd * mask).sum() / mask.sum().clamp_min(1.0)
-    else:
-        kd = kd.mean()
+        flat_mask = attention_mask.view(-1).bool()
+        if flat_mask.any():
+            student_log_probs = student_log_probs[flat_mask]
+            teacher_probs = teacher_probs[flat_mask]
+        else:
+            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
+
+    kd = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
 
     return kd * (temperature**2)
 
+# This is for checking kd_loss stats.
+def compute_alignment_stats(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+):
+    """Utility to inspect how far the student is from the teacher outputs.
+
+    Returns a dictionary with:
+
+    - ``kd_loss``: the KL-divergence based knowledge-distillation loss.
+    - ``logits_l2``: mean squared difference between the raw logits.
+    - ``prob_l1``: mean absolute difference between the softened probabilities.
+    """
+
+    with torch.no_grad():
+        kd_loss = compute_kd_loss(
+            student_logits,
+            teacher_logits,
+            attention_mask=attention_mask,
+            temperature=temperature,
+        )
+
+        student_probs = F.softmax(student_logits / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1)
+            student_probs = student_probs * mask
+            teacher_probs = teacher_probs * mask
+
+        logits_l2 = (student_logits - teacher_logits).pow(2)
+        prob_l1 = (student_probs - teacher_probs).abs()
+
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1)
+            logits_l2 = logits_l2 * mask
+            prob_l1 = prob_l1 * mask
+            normalizer = mask.sum().clamp_min(1).to(logits_l2.dtype)
+        else:
+            normalizer = torch.tensor(
+                student_logits.numel() / student_logits.size(-1),
+                device=student_logits.device,
+                dtype=student_logits.dtype,
+            )
+
+        logits_l2 = logits_l2.sum() / normalizer
+        prob_l1 = prob_l1.sum() / normalizer
+
+    return {
+        "kd_loss": kd_loss.item(),
+        "logits_l2": logits_l2.item(),
+        "prob_l1": prob_l1.item(),
+    }
+
+# This block is about training process.
+def distillation_step(
+    teacher_model: LlavaOnevisionForConditionalGeneration,
+    student_model: LlavaOnevisionForConditionalGeneration,
+    optimizer: torch.optim.Optimizer,
+    batch,
+    device: Optional[torch.device] = None,
+    temperature: float = 1.0,
+):
+    """Perform a single optimization step using knowledge distillation."""
+
+    teacher_outputs, student_outputs, model_inputs = forward_teacher_student(
+        teacher_model, student_model, batch, device
+    )
+
+    attention_mask = model_inputs.get("attention_mask")
+
+    loss = compute_kd_loss(
+        student_outputs.logits, teacher_outputs.logits, attention_mask, temperature
+    )
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+
+def run_distillation_epoch(
+    teacher_model: LlavaOnevisionForConditionalGeneration,
+    student_model: LlavaOnevisionForConditionalGeneration,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: Optional[torch.device] = None,
+    temperature: float = 1.0,
+    max_batches: Optional[int] = None,
+):
+    """Iterate over ``dataloader`` performing KD training steps.
+
+    Parameters
+    ----------
+    max_batches:
+        Optional safeguard to limit the number of processed batches.
+    """
+
+    student_model.train()
+    total_loss = 0.0
+    num_batches = 0
+
+    for num_batches, batch in enumerate(dataloader, start=1):
+        loss = distillation_step(
+            teacher_model,
+            student_model,
+            optimizer,
+            batch,
+            device=device,
+            temperature=temperature,
+        )
+        total_loss += loss
+
+        if max_batches is not None and num_batches >= max_batches:
+            break
+
+    average_loss = total_loss / max(num_batches, 1)
+    return {
+        "average_loss": average_loss,
+        "num_batches": num_batches,
+    }
 
 # Test.
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -233,8 +410,8 @@ folder_name = "tmp"
 count_jpg_in_folder(folder_name)
 image_paths = get_dirs_with_jpg(folder_name)
 processor = AutoProcessor.from_pretrained("E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
-dataset = PolicyImageDataset(image_paths, processor, policy)
-dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+dataset = PolicyImageDataset(image_paths, policy)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=build_policy_collate_fn(processor),)
 dataloader_ = iter(dataloader)
 batch = next(dataloader_)
 
@@ -246,8 +423,8 @@ student_model.train()
 teacher_model.to(device)
 student_model.to(device)
 
-# t_o, s_o, m_i = forward_teacher_student(teacher_model, student_model, batch, device)
-print(1)
+t_o, s_o, m_i = forward_teacher_student(teacher_model, student_model, batch, device)
+diff_dict = compute_alignment_stats(s_o.logits, t_o.logits)
 
 
 
