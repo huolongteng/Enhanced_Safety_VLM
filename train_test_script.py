@@ -188,7 +188,7 @@ def apply_chat_template_to_batch(
 
 
 def build_policy_collate_fn(
-    processor: AutoProcessor,
+    processor,
     *,
     add_generation_prompt: bool = True,
     padding: bool = True,
@@ -223,8 +223,8 @@ def load_model_and_processor(teacher_path, student_path):
     t_ = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
     s_ = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
     p_ = AutoProcessor.from_pretrained(teacher_path)
-    t_.config.sliding_window = None
-    s_.config.sliding_window = None
+    t_.config.sliding_window = False
+    s_.config.sliding_window = False
     return t_, s_, p_
 
 def _move_batch_to_device(batch, device):
@@ -255,9 +255,9 @@ def forward_teacher_student(
     return teacher_outputs, student_outputs, model_inputs
 
 def compute_kd_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
+    student_logits,
+    teacher_logits,
+    attention_mask,
     temperature: float = 1.0,
 ):
     """Compute the standard KL-divergence loss for knowledge distillation."""
@@ -282,8 +282,8 @@ def compute_kd_loss(
 
 # This is for checking kd_loss stats.
 def compute_alignment_stats(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
+    student_logits,
+    teacher_logits,
     attention_mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
 ):
@@ -367,11 +367,11 @@ def distillation_step(
     return loss.item()
 
 def run_distillation_epoch(
-    teacher_model: LlavaOnevisionForConditionalGeneration,
-    student_model: LlavaOnevisionForConditionalGeneration,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: Optional[torch.device] = None,
+    teacher_model,
+    student_model,
+    dataloader,
+    optimizer,
+    device,
     temperature: float = 1.0,
     max_batches: Optional[int] = None,
 ):
@@ -490,7 +490,7 @@ plt.title("Knowledge Distillation Training Loss (Epoch)")
 plt.grid(True)
 plt.legend()
 plt.tight_layout()
-epoch_plot_path = Path("loss_curve_epoch.png")
+epoch_plot_path = Path("exp_1031/loss_curve_epoch.png")
 plt.savefig(epoch_plot_path)
 plt.close()
 print(f"Saved epoch loss curve to {epoch_plot_path.resolve()}")
@@ -505,12 +505,12 @@ if step_losses:
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    step_plot_path = Path("loss_curve_step.png")
+    step_plot_path = Path("exp_1031/loss_curve_step.png")
     plt.savefig(step_plot_path)
     plt.close()
     print(f"Saved step loss curve to {step_plot_path.resolve()}")
 
-save_path = Path("student_model_state.pt")
+save_path = Path("exp_1031/student_model_state.pt")
 torch.save(student_model.state_dict(), save_path)
 print(f"Saved student model parameters to {save_path.resolve()}")
 
