@@ -133,16 +133,11 @@ from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 # This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
-    def __init__(self, image_paths, policy, image_size=256):
+    def __init__(self, image_paths, policy, image_size=64):
         self.image_paths = image_paths
         self.policy = policy
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
-            # transforms.ToTensor(),
-            # transforms.Normalize(
-            #     mean=(0.5, 0.5, 0.5),  # Maybe use ImageNet mean and std instead.
-            #     std=(0.5, 0.5, 0.5)
-            # ),
         ])
     def __len__(self):
         return len(self.image_paths)
@@ -222,7 +217,7 @@ def build_policy_collate_fn(
 def load_model_and_processor(teacher_path, student_path):
     t_ = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
     s_ = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
-    p_ = AutoProcessor.from_pretrained(teacher_path)
+    p_ = AutoProcessor.from_pretrained(teacher_path, use_fast=True)
     t_.config.sliding_window = False
     s_.config.sliding_window = False
     return t_, s_, p_
@@ -280,70 +275,17 @@ def compute_kd_loss(
 
     return kd * (temperature**2)
 
-# This is for checking kd_loss stats.
-def compute_alignment_stats(
-    student_logits,
-    teacher_logits,
-    attention_mask: Optional[torch.Tensor] = None,
-    temperature: float = 1.0,
-):
-    """Utility to inspect how far the student is from the teacher outputs.
 
-    Returns a dictionary with:
 
-    - ``kd_loss``: the KL-divergence based knowledge-distillation loss.
-    - ``logits_l2``: mean squared difference between the raw logits.
-    - ``prob_l1``: mean absolute difference between the softened probabilities.
-    """
-
-    with torch.no_grad():
-        kd_loss = compute_kd_loss(
-            student_logits,
-            teacher_logits,
-            attention_mask=attention_mask,
-            temperature=temperature,
-        )
-
-        student_probs = F.softmax(student_logits / temperature, dim=-1)
-        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1)
-            student_probs = student_probs * mask
-            teacher_probs = teacher_probs * mask
-
-        logits_l2 = (student_logits - teacher_logits).pow(2)
-        prob_l1 = (student_probs - teacher_probs).abs()
-
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1)
-            logits_l2 = logits_l2 * mask
-            prob_l1 = prob_l1 * mask
-            normalizer = mask.sum().clamp_min(1).to(logits_l2.dtype)
-        else:
-            normalizer = torch.tensor(
-                student_logits.numel() / student_logits.size(-1),
-                device=student_logits.device,
-                dtype=student_logits.dtype,
-            )
-
-        logits_l2 = logits_l2.sum() / normalizer
-        prob_l1 = prob_l1.sum() / normalizer
-
-    return {
-        "kd_loss": kd_loss.item(),
-        "logits_l2": logits_l2.item(),
-        "prob_l1": prob_l1.item(),
-    }
 
 # This block is about training process.
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 def distillation_step(
-    teacher_model: LlavaOnevisionForConditionalGeneration,
-    student_model: LlavaOnevisionForConditionalGeneration,
-    optimizer: torch.optim.Optimizer,
+    teacher_model,
+    student_model,
+    optimizer,
     batch,
     device,
     temperature: float = 1.0,
@@ -366,46 +308,6 @@ def distillation_step(
 
     return loss.item()
 
-def run_distillation_epoch(
-    teacher_model,
-    student_model,
-    dataloader,
-    optimizer,
-    device,
-    temperature: float = 1.0,
-    max_batches: Optional[int] = None,
-):
-    """Iterate over ``dataloader`` performing KD training steps.
-
-    Parameters
-    ----------
-    max_batches:
-        Optional safeguard to limit the number of processed batches.
-    """
-
-    student_model.train()
-    total_loss = 0.0
-    num_batches = 0
-
-    for num_batches, batch in enumerate(dataloader, start=1):
-        loss = distillation_step(
-            teacher_model,
-            student_model,
-            optimizer,
-            batch,
-            device=device,
-            temperature=temperature,
-        )
-        total_loss += loss
-
-        if max_batches is not None and num_batches >= max_batches:
-            break
-
-    average_loss = total_loss / max(num_batches, 1)
-    return {
-        "average_loss": average_loss,
-        "num_batches": num_batches,
-    }
 
 # Set random seed.
 import random
@@ -419,100 +321,112 @@ def same_seeds(seed=443):
     torch.backends.cudnn.deterministic = True
 same_seeds(2025)
 
-# Test.
-device = "cuda" if torch.cuda.is_available() else "cpu"
-folder_name = "tmp"
-count_jpg_in_folder(folder_name)
-image_paths = get_dirs_with_jpg(folder_name)
 
-image_paths = random.sample(image_paths, min(300, len(image_paths)))
 
-processor = AutoProcessor.from_pretrained("E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
-dataset = PolicyImageDataset(image_paths, policy)
-dataloader = DataLoader(
-    dataset,
-    batch_size=1,
-    shuffle=True,
-    collate_fn=build_policy_collate_fn(processor),
-)
+if __name__ == "__main__":
+    # Test.
 
-teacher_model, student_model, processor = load_model_and_processor(
+    # Filter out warnings.
+    from transformers.utils import logging
+    logging.set_verbosity_error()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    folder_name = "tmp"
+    count_jpg_in_folder(folder_name)
+    image_paths = get_dirs_with_jpg(folder_name)
+
+    image_paths = random.sample(image_paths, min(2, len(image_paths)))
+
+    teacher_model, student_model, processor = load_model_and_processor(
         "E:\models\LlavaGuard-v1.2-0.5B-OV-hf", "E:\models\llava-onevision-qwen2-0.5b-ov-hf"
     )
-teacher_model.eval()
-teacher_model.to(device)
-student_model.to(device)
-
-optimizer = torch.optim.AdamW(student_model.parameters(), lr=5e-5)
-num_epochs = 10
-epoch_losses = []
-step_losses: List[float] = []
-global_step = 0
-
-for epoch in range(num_epochs):
-    student_model.train()
-    progress_bar = tqdm(
-        dataloader,
-        desc=f"Epoch {epoch + 1}/{num_epochs}",
-        leave=True,
-        dynamic_ncols=True,
+    dataset = PolicyImageDataset(image_paths, policy)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=build_policy_collate_fn(processor),
     )
-    running_loss = 0.0
-    num_batches = 0
 
-    for batch in progress_bar:
-        loss = distillation_step(
-            teacher_model,
-            student_model,
-            optimizer,
-            batch,
-            device=device,
+    teacher_model.eval()
+    teacher_model.to(device)
+    student_model.to(device)
+
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=5e-5)
+    num_epochs = 100
+    epoch_losses = []
+    step_losses: List[float] = []
+    global_step = 0
+    distill_temperature = 3.0
+
+    for epoch in range(num_epochs):
+        student_model.train()
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            leave=False,
+            dynamic_ncols=True,
         )
-        running_loss += loss
-        num_batches += 1
-        global_step += 1
-        step_losses.append(loss)
-        progress_bar.set_postfix({
-            "loss": f"{loss:.4f}",
-            "step": global_step,
-        })
+        running_loss = 0.0
+        num_batches = 0
 
-    average_loss = running_loss / max(num_batches, 1)
-    epoch_losses.append(average_loss)
-    tqdm.write(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
+        for batch in progress_bar:
+            loss = distillation_step(
+                teacher_model,
+                student_model,
+                optimizer,
+                batch,
+                device=device,
+                temperature=distill_temperature,
+            )
+            running_loss += loss
+            num_batches += 1
+            global_step += 1
+            step_losses.append(loss)
+            progress_bar.set_postfix({
+                "loss": f"{loss:.4f}",
+                "step": global_step,
+            })
 
-epochs = range(1, num_epochs + 1)
-plt.figure(figsize=(8, 5))
-plt.plot(epochs, epoch_losses, marker="o", label="Epoch Avg Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Average Loss")
-plt.title("Knowledge Distillation Training Loss (Epoch)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-epoch_plot_path = Path("exp_1031/loss_curve_epoch.png")
-plt.savefig(epoch_plot_path)
-plt.close()
-print(f"Saved epoch loss curve to {epoch_plot_path.resolve()}")
+        average_loss = running_loss / max(num_batches, 1)
+        epoch_losses.append(average_loss)
+        tqdm.write(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
 
-if step_losses:
-    steps = range(1, len(step_losses) + 1)
+    epochs = range(1, num_epochs + 1)
     plt.figure(figsize=(8, 5))
-    plt.plot(steps, step_losses, label="Step Loss")
-    plt.xlabel("Training Step")
-    plt.ylabel("Loss")
-    plt.title("Knowledge Distillation Training Loss (Step)")
+    plt.plot(epochs, epoch_losses, marker="o", label="Epoch Avg Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Average Loss")
+    plt.title("Knowledge Distillation Training Loss (Epoch)")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    step_plot_path = Path("exp_1031/loss_curve_step.png")
-    plt.savefig(step_plot_path)
+    epoch_plot_path = Path("loss_curve_epoch.png")
+    plt.savefig(epoch_plot_path)
     plt.close()
-    print(f"Saved step loss curve to {step_plot_path.resolve()}")
+    print(f"Saved epoch loss curve to {epoch_plot_path.resolve()}")
 
-save_path = Path("exp_1031/student_model_state.pt")
-torch.save(student_model.state_dict(), save_path)
-print(f"Saved student model parameters to {save_path.resolve()}")
+    if step_losses:
+        steps = range(1, len(step_losses) + 1)
+        stride = 50  # Plot every 50 steps to reduce clutter.
+        steps_plot = steps[::stride]
+        losses_plot = step_losses[::stride]
+        plt.figure(figsize=(8, 5))
+        plt.plot(steps_plot, losses_plot, label=f"Step Loss (every {stride})")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.title("Knowledge Distillation Training Loss (Step)")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        step_plot_path = Path("loss_curve_step.png")
+        plt.savefig(step_plot_path)
+        plt.close()
+        print(f"Saved step loss curve to {step_plot_path.resolve()}")
+
+    save_path = Path("student_model_state.pt")
+    torch.save(student_model.state_dict(), save_path)
+    print(f"Saved student model parameters to {save_path.resolve()}")
 
 
 
