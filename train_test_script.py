@@ -133,7 +133,7 @@ from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 # This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
-    def __init__(self, image_paths, policy, image_size=128):
+    def __init__(self, image_paths, policy, image_size=256):
         self.image_paths = image_paths
         self.policy = policy
         self.transform = transforms.Compose([
@@ -425,7 +425,7 @@ folder_name = "tmp"
 count_jpg_in_folder(folder_name)
 image_paths = get_dirs_with_jpg(folder_name)
 
-image_paths = random.sample(image_paths, min(200, len(image_paths)))
+image_paths = random.sample(image_paths, min(300, len(image_paths)))
 
 processor = AutoProcessor.from_pretrained("E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
 dataset = PolicyImageDataset(image_paths, policy)
@@ -454,7 +454,8 @@ for epoch in range(num_epochs):
     progress_bar = tqdm(
         dataloader,
         desc=f"Epoch {epoch + 1}/{num_epochs}",
-        leave=False,
+        leave=True,
+        dynamic_ncols=True,
     )
     running_loss = 0.0
     num_batches = 0
@@ -478,7 +479,7 @@ for epoch in range(num_epochs):
 
     average_loss = running_loss / max(num_batches, 1)
     epoch_losses.append(average_loss)
-    print(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
+    tqdm.write(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
 
 epochs = range(1, num_epochs + 1)
 plt.figure(figsize=(8, 5))
