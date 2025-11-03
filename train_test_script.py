@@ -94,7 +94,7 @@ To provide your assessment use the following json template:
 from pathlib import Path
 
 # This function counts the number of .jpg files in the indicated folder.
-def count_jpg_in_folder(folder_name) -> int:
+def count_jpg_in_folder(folder_name):
     base_dir = Path(__file__).parent
     tmp_dir = base_dir / folder_name
     if not tmp_dir.exists() or not tmp_dir.is_dir():
@@ -107,7 +107,7 @@ def count_jpg_in_folder(folder_name) -> int:
 from typing import Any, Callable, List, Optional, Sequence
 
 
-def get_dirs_with_jpg(base_folder_name: str = "tmp") -> List[str]:
+def get_dirs_with_jpg(base_folder_name):
     """
     Returns a list of the absolute paths of all '.jpg' or '.jpeg' image files
     (recursively) under `base_folder_name`.
@@ -133,7 +133,7 @@ from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 # This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
-    def __init__(self, image_paths, policy, image_size=64):
+    def __init__(self, image_paths, policy, image_size=256):
         self.image_paths = image_paths
         self.policy = policy
         self.transform = transforms.Compose([
@@ -166,10 +166,10 @@ import torch
 import torch.nn.functional as F
 
 def apply_chat_template_to_batch(
-    conversations: Sequence[Sequence[dict]],
-    processor: AutoProcessor,
+    conversations,
+    processor,
     add_generation_prompt: bool = True,
-) -> List[str]:
+):
     """Apply the chat template to a batch of conversations."""
 
     return [
@@ -276,8 +276,6 @@ def compute_kd_loss(
     return kd * (temperature**2)
 
 
-
-
 # This block is about training process.
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -335,7 +333,7 @@ if __name__ == "__main__":
     count_jpg_in_folder(folder_name)
     image_paths = get_dirs_with_jpg(folder_name)
 
-    image_paths = random.sample(image_paths, min(2, len(image_paths)))
+    image_paths = random.sample(image_paths, min(800, len(image_paths)))
 
     teacher_model, student_model, processor = load_model_and_processor(
         "E:\models\LlavaGuard-v1.2-0.5B-OV-hf", "E:\models\llava-onevision-qwen2-0.5b-ov-hf"
@@ -352,12 +350,12 @@ if __name__ == "__main__":
     teacher_model.to(device)
     student_model.to(device)
 
-    optimizer = torch.optim.AdamW(student_model.parameters(), lr=5e-5)
-    num_epochs = 100
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=7e-5)
+    num_epochs = 10
     epoch_losses = []
     step_losses: List[float] = []
     global_step = 0
-    distill_temperature = 3.0
+    distill_temperature = 5.0
 
     for epoch in range(num_epochs):
         student_model.train()
