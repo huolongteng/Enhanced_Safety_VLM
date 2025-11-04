@@ -333,7 +333,7 @@ if __name__ == "__main__":
     count_jpg_in_folder(folder_name)
     image_paths = get_dirs_with_jpg(folder_name)
 
-    image_paths = random.sample(image_paths, min(800, len(image_paths)))
+    image_paths = random.sample(image_paths, min(100, len(image_paths)))
 
     teacher_model, student_model, processor = load_model_and_processor(
         "E:\models\LlavaGuard-v1.2-0.5B-OV-hf", "E:\models\llava-onevision-qwen2-0.5b-ov-hf"
@@ -351,11 +351,11 @@ if __name__ == "__main__":
     student_model.to(device)
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=7e-5)
-    num_epochs = 10
+    num_epochs = 50
     epoch_losses = []
     step_losses: List[float] = []
     global_step = 0
-    distill_temperature = 5.0
+    distill_temperature = 2.0
 
     for epoch in range(num_epochs):
         student_model.train()
@@ -406,7 +406,7 @@ if __name__ == "__main__":
 
     if step_losses:
         steps = range(1, len(step_losses) + 1)
-        stride = 50  # Plot every 50 steps to reduce clutter.
+        stride = 10  # Plot every 50 steps to reduce clutter.
         steps_plot = steps[::stride]
         losses_plot = step_losses[::stride]
         plt.figure(figsize=(8, 5))
