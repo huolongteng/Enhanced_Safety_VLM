@@ -1,9 +1,12 @@
 # This block is about dataset handling and preprocessing for a machine learning project.
+import json
+import random
 from pathlib import Path
-from torch.utils.data import Dataset
-from PIL import Image
-from torchvision import transforms
 from typing import Any, Callable, List, Optional, Sequence
+
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 
 def count_jpg_in_folder(folder_name):
     """
@@ -39,6 +42,50 @@ def get_dirs_with_jpg(base_folder_name):
 
     print(f"Found {len(image_paths)} .jpg/.jpeg files under `{target_dir}`.")
     return image_paths
+
+
+def load_policy_text(policy_file: Path | str, index: int = 0) -> str:
+    """Load the policy string located at ``index`` from ``policy_file``."""
+
+    policy_path = Path(policy_file)
+    if not policy_path.exists():
+        raise FileNotFoundError(f"Policy file not found: {policy_path}")
+
+    with policy_path.open("r", encoding="utf-8") as fp:
+        data = json.load(fp)
+
+    policies: Sequence[str] = []
+    if isinstance(data, dict):
+        if "policy" in data:
+            policies = data["policy"]
+        elif "policies" in data:
+            policies = data["policies"]
+    elif isinstance(data, Sequence):
+        policies = data
+
+    if not policies:
+        raise ValueError(f"No policies found in policy file: {policy_path}")
+
+    if not 0 <= index < len(policies):
+        index = 0
+
+    return policies[index]
+
+
+def gather_image_paths(base_folder_name: str, limit: Optional[int] = None) -> List[str]:
+    """Collect the image paths under ``base_folder_name`` with an optional limit."""
+
+    count_jpg_in_folder(base_folder_name)
+    image_paths = get_dirs_with_jpg(base_folder_name)
+    if not image_paths:
+        raise ValueError(
+            f"No .jpg/.jpeg files were found under directory: {base_folder_name}"
+        )
+
+    if limit is None or limit <= 0 or len(image_paths) <= limit:
+        return image_paths
+
+    return random.sample(image_paths, limit)
 
 # This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
@@ -113,3 +160,32 @@ def build_policy_collate_fn(
             return_tensors=return_tensors,
             **processor_kwargs,
         )
+
+    return collate_fn
+
+
+def create_policy_dataloader(
+    image_paths: Sequence[str],
+    policy_text: str,
+    processor,
+    *,
+    batch_size: int,
+    image_size: int,
+    shuffle: bool = True,
+) -> DataLoader:
+    """Build a dataloader for the policy-conditioned image dataset."""
+
+    dataset = PolicyImageDataset(image_paths, policy_text, image_size=image_size)
+    collate_fn = build_policy_collate_fn(
+        processor,
+        add_generation_prompt=True,
+        padding=True,
+        return_tensors="pt",
+    )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+    )
