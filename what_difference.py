@@ -9,6 +9,9 @@ from PIL import Image
 from transformers import AutoConfig, AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 from train_test_script import count_jpg_in_folder, get_dirs_with_jpg
+from transformers.utils import logging
+logging.set_verbosity_error()
+
 # Student model loading.
 config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
 model_student = LlavaOnevisionForConditionalGeneration(config)
