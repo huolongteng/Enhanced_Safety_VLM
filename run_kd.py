@@ -25,12 +25,12 @@ logging.set_verbosity_error()
 # ---------------------------------------------------------------------------
 
 IMAGE_FOLDER = "tmp"
-MAX_IMAGES = 1
+MAX_IMAGES = 100
 TEACHER_MODEL_PATH = "E:/models/LlavaGuard-v1.2-0.5B-OV-hf"
 STUDENT_MODEL_PATH = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"
 POLICY_PATH = Path("policy.json")
 POLICY_INDEX = 0
-NUM_EPOCHS = 10
+NUM_EPOCHS = 30
 BATCH_SIZE = 1
 LEARNING_RATE = 7e-5
 DISTILL_TEMPERATURE = 2.0

@@ -145,18 +145,22 @@ def run_kd_training(
     step_losses: list[float] = []
     global_step = 0
 
+    batch_size = getattr(dataloader, "batch_size", None)
+
+    epoch_progress = tqdm(
+        total=num_epochs,
+        desc="Training",
+        unit="epoch",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
     for epoch in range(num_epochs):
         student_model.train()
-        progress_bar = tqdm(
-            dataloader,
-            desc=f"Epoch {epoch + 1}/{num_epochs}",
-            leave=False,
-            dynamic_ncols=True,
-        )
         running_loss = 0.0
         num_batches = 0
 
-        for batch in progress_bar:
+        for batch in dataloader:
             loss_value = distillation_step(
                 teacher_model,
                 student_model,
@@ -169,11 +173,25 @@ def run_kd_training(
             num_batches += 1
             global_step += 1
             step_losses.append(loss_value)
-            progress_bar.set_postfix({"loss": f"{loss_value:.4f}", "step": global_step})
 
         average_loss = running_loss / max(num_batches, 1)
         epoch_losses.append(average_loss)
-        tqdm.write(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        metrics = [
+            f"Epoch {epoch + 1}/{num_epochs}",
+            f"average_loss={average_loss:.4f}",
+            f"lr={current_lr:.6g}",
+            f"temperature={temperature:.2f}",
+        ]
+        if batch_size is not None:
+            metrics.append(f"batch_size={batch_size}")
+        metrics.append(f"steps={global_step}")
+
+        epoch_progress.write(" | ".join(metrics))
+        epoch_progress.update(1)
+
+    epoch_progress.close()
 
     return DistillationStats(epoch_losses=epoch_losses, step_losses=step_losses)
 
