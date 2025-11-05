@@ -90,6 +90,95 @@ def compute_kd_loss(
     return kd * (temperature**2)
 
 
+def _extract_projector_hidden_states(model_outputs) -> torch.Tensor | None:
+    """Return the projector hidden states tensor if the model exposes it."""
+
+    if model_outputs is None:
+        return None
+
+    candidate = None
+    for attr in (
+        "projector_hidden_states",
+        "multi_modal_projector_hidden_states",
+        "multimodal_projector_hidden_states",
+        "vision_projector_hidden_states",
+    ):
+        if hasattr(model_outputs, attr):
+            candidate = getattr(model_outputs, attr)
+            break
+
+    if candidate is None and isinstance(model_outputs, dict):
+        for key in (
+            "projector_hidden_states",
+            "multi_modal_projector_hidden_states",
+            "multimodal_projector_hidden_states",
+            "vision_projector_hidden_states",
+        ):
+            if key in model_outputs:
+                candidate = model_outputs[key]
+                break
+
+    if candidate is None:
+        return None
+
+    if isinstance(candidate, (list, tuple)) and candidate:
+        candidate = candidate[-1]
+
+    if not isinstance(candidate, torch.Tensor):
+        return None
+
+    return candidate
+
+
+def _reshape_projector_tokens(states: torch.Tensor) -> torch.Tensor:
+    """Ensure projector states are shaped as ``(batch, tokens, dim)``."""
+
+    if states.dim() == 3:
+        return states
+
+    if states.dim() < 3:
+        return states.unsqueeze(1)
+
+    return states.reshape(states.size(0), -1, states.size(-1))
+
+
+def compute_projector_alignment_loss(
+    student_outputs,
+    teacher_outputs,
+) -> torch.Tensor | None:
+    """Cosine + MSE alignment between teacher and student projector tokens."""
+
+    student_states = _extract_projector_hidden_states(student_outputs)
+    teacher_states = _extract_projector_hidden_states(teacher_outputs)
+
+    if student_states is None or teacher_states is None:
+        return None
+
+    if student_states.dim() < 2 or teacher_states.dim() < 2:
+        return None
+
+    # Align sequence length if they differ.
+    min_tokens = min(student_states.size(1), teacher_states.size(1))
+    if min_tokens <= 0:
+        return None
+    student_states = student_states[:, :min_tokens]
+    teacher_states = teacher_states[:, :min_tokens]
+
+    student_states = _reshape_projector_tokens(student_states)
+    teacher_states = _reshape_projector_tokens(teacher_states)
+
+    teacher_states = teacher_states.detach().to(student_states.dtype)
+
+    student_norm = F.normalize(student_states, dim=-1)
+    teacher_norm = F.normalize(teacher_states, dim=-1)
+
+    cosine_sim = (student_norm * teacher_norm).sum(dim=-1).mean()
+    loss_cos = 1.0 - cosine_sim
+    loss_mse = F.mse_loss(student_states, teacher_states)
+
+    return loss_cos + 0.1 * loss_mse
+
+
 def distillation_step(
     teacher_model,
     student_model,
@@ -98,6 +187,7 @@ def distillation_step(
     *,
     device,
     temperature: float,
+    projector_loss_weight: float,
 ) -> float:
     """Perform a single optimization step of knowledge distillation."""
 
@@ -109,18 +199,29 @@ def distillation_step(
     )
 
     attention_mask = model_inputs.get("attention_mask")
-    loss = compute_kd_loss(
+    kd_loss = compute_kd_loss(
         student_outputs.logits,
         teacher_outputs.logits,
         attention_mask,
         temperature=temperature,
     )
 
+    total_loss = kd_loss
+    projector_loss = None
+    if projector_loss_weight > 0.0:
+        projector_loss = compute_projector_alignment_loss(
+            student_outputs,
+            teacher_outputs,
+        )
+        if projector_loss is not None:
+            mix = max(0.0, min(1.0, projector_loss_weight))
+            total_loss = (1.0 - mix) * kd_loss + mix * projector_loss
+
     optimizer.zero_grad()
-    loss.backward()
+    total_loss.backward()
     optimizer.step()
 
-    return float(loss.item())
+    return float(total_loss.item())
 
 
 def run_kd_training(
@@ -132,6 +233,7 @@ def run_kd_training(
     learning_rate: float,
     temperature: float,
     num_epochs: int,
+    projector_loss_weight: float = 1.0,
 ) -> DistillationStats:
     """Train ``student_model`` to mimic ``teacher_model`` using ``dataloader``."""
 
@@ -168,6 +270,7 @@ def run_kd_training(
                 batch,
                 device=device,
                 temperature=temperature,
+                projector_loss_weight=projector_loss_weight,
             )
             running_loss += loss_value
             num_batches += 1

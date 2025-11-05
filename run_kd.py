@@ -34,6 +34,7 @@ NUM_EPOCHS = 30
 BATCH_SIZE = 1
 LEARNING_RATE = 7e-5
 DISTILL_TEMPERATURE = 2.0
+PROJECTOR_LOSS_WEIGHT = 0.6
 STEP_PLOT_STRIDE = 10
 IMAGE_SIZE = 256
 OUTPUT_DIR = Path(".")
@@ -54,6 +55,7 @@ class KDConfig:
     batch_size: int = BATCH_SIZE
     learning_rate: float = LEARNING_RATE
     distill_temperature: float = DISTILL_TEMPERATURE
+    projector_loss_weight: float = PROJECTOR_LOSS_WEIGHT
     step_plot_stride: int = STEP_PLOT_STRIDE
     image_size: int = IMAGE_SIZE
     output_dir: Path = OUTPUT_DIR
@@ -100,6 +102,7 @@ def main(config: KDConfig | None = None) -> DistillationStats:
         learning_rate=cfg.learning_rate,
         temperature=cfg.distill_temperature,
         num_epochs=cfg.num_epochs,
+        projector_loss_weight=cfg.projector_loss_weight,
     )
 
     save_training_artifacts(
