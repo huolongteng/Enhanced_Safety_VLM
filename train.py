@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from transformers.optimization import get_cosine_schedule_with_warmup
 
 
 @dataclass
@@ -243,16 +244,34 @@ def run_kd_training(
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
 
+    scheduler = None
+
     epoch_losses: list[float] = []
     step_losses: list[float] = []
     global_step = 0
 
     batch_size = getattr(dataloader, "batch_size", None)
 
-    epoch_progress = tqdm(
-        total=num_epochs,
+    steps_per_epoch = None
+    try:
+        steps_per_epoch = len(dataloader)
+    except TypeError:
+        steps_per_epoch = None
+
+    total_steps = None
+    if steps_per_epoch is not None and steps_per_epoch > 0:
+        total_steps = steps_per_epoch * num_epochs
+        warmup_steps = max(1, int(0.1 * total_steps))
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+
+    progress_bar = tqdm(
+        total=total_steps,
         desc="Training",
-        unit="epoch",
+        unit="step" if total_steps is not None else "batch",
         dynamic_ncols=True,
         leave=True,
     )
@@ -261,6 +280,8 @@ def run_kd_training(
         student_model.train()
         running_loss = 0.0
         num_batches = 0
+
+        progress_bar.set_description(f"Training (epoch {epoch + 1}/{num_epochs})")
 
         for batch in dataloader:
             loss_value = distillation_step(
@@ -276,6 +297,10 @@ def run_kd_training(
             num_batches += 1
             global_step += 1
             step_losses.append(loss_value)
+            progress_bar.update(1)
+
+            if scheduler is not None:
+                scheduler.step()
 
         average_loss = running_loss / max(num_batches, 1)
         epoch_losses.append(average_loss)
@@ -291,10 +316,11 @@ def run_kd_training(
             metrics.append(f"batch_size={batch_size}")
         metrics.append(f"steps={global_step}")
 
-        epoch_progress.write(" | ".join(metrics))
-        epoch_progress.update(1)
+        progress_bar.write(" | ".join(metrics))
+        if total_steps is None:
+            progress_bar.refresh()
 
-    epoch_progress.close()
+    progress_bar.close()
 
     return DistillationStats(epoch_losses=epoch_losses, step_losses=step_losses)
 

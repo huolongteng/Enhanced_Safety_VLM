@@ -13,10 +13,11 @@ from transformers.utils import logging
 logging.set_verbosity_error()
 
 # Student model loading.
-config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
-model_student = LlavaOnevisionForConditionalGeneration(config)
-state_dict = torch.load("exp_1104_50_epochs/student_model_state.pt", map_location='cpu')
-model_student.load_state_dict(state_dict, strict=False)
+# config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
+# model_student = LlavaOnevisionForConditionalGeneration(config)
+# state_dict = torch.load("exp_1104_50_epochs/student_model_state.pt", map_location='cpu')
+# model_student.load_state_dict(state_dict, strict=False)
+model_student = LlavaOnevisionForConditionalGeneration.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
 # Teacher model loading.
 model_teacher = LlavaOnevisionForConditionalGeneration.from_pretrained("E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
 processor = AutoProcessor.from_pretrained('E:\models\llava-onevision-qwen2-0.5b-ov-hf')

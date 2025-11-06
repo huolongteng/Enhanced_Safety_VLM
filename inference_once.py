@@ -7,12 +7,12 @@ import random
 with open('policy.json', 'r') as f:
     policy = json.load(f)['policies'][0]
 
-policy = "What is shown in the image? Provide a detailed description."
+# policy = "What is shown in the image? Provide a detailed description."
 import torch
 from transformers import AutoConfig
 config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
 model = LlavaOnevisionForConditionalGeneration(config)
-state_dict = torch.load("exp_1104_50_epochs/student_model_state.pt", map_location='cpu')
+state_dict = torch.load("exp_1106/student_model_state.pt", map_location='cpu')
 model.load_state_dict(state_dict, strict=False)
 
 # model = LlavaOnevisionForConditionalGeneration.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
