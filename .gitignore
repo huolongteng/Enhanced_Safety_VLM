@@ -8,3 +8,5 @@
 /exp_1103/
 /exp_1104_50_epochs/
 /exp_1106/
+/test_flashattn.py
+/verify_sha256.py

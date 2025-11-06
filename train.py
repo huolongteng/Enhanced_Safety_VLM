@@ -1,17 +1,13 @@
 """Training helpers for the knowledge-distillation workflow."""
-
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
-
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.optimization import get_cosine_schedule_with_warmup
-
 
 @dataclass
 class DistillationStats:
@@ -46,6 +42,63 @@ def _move_batch_to_device(batch, device):
         else:
             moved[key] = value
     return moved
+
+
+def freeze_student_vision_and_projector(student_model) -> list[str]:
+    """Freeze the vision tower and projector weights of ``student_model``.
+
+    The user workflow only wants to optimize the language-model parameters.
+    To respect that requirement we mark every parameter belonging to the
+    visual backbone (``vision_tower``) and projector modules as
+    ``requires_grad = False``.  This prevents the optimizer from updating the
+    weights while keeping the modules available for the forward pass.  The
+    function returns the attribute names that were successfully frozen so the
+    caller can log them if desired.
+    """
+
+    frozen_components: list[str] = []
+
+    # Candidate attribute names observed in LLaVA-style models.  If new
+    # variants introduce alternative names, extend this tuple so those modules
+    # are frozen automatically as well.
+    candidate_attrs = (
+        "vision_tower",
+        "vision_model",
+        "multi_modal_projector",
+        "multimodal_projector",
+        "vision_projector",
+        "mm_projector",
+        "projector",
+    )
+
+    # Some model wrappers keep the real modules under ``model`` (e.g. ``.model``
+    # holds the actual LLaVA implementation).  Iterate over both the wrapper
+    # and the nested model to cover each case without making assumptions about
+    # the exact class hierarchy.
+    candidate_parents = [student_model]
+    if hasattr(student_model, "model") and getattr(student_model, "model") is not None:
+        candidate_parents.append(getattr(student_model, "model"))
+
+    for parent in candidate_parents:
+        for attr in candidate_attrs:
+            if not hasattr(parent, attr):
+                continue
+
+            module = getattr(parent, attr)
+            if module is None:
+                continue
+
+            # If the attribute exposes parameters, disable their gradients.
+            parameters = getattr(module, "parameters", None)
+            if parameters is None:
+                continue
+
+            for param in parameters():
+                param.requires_grad = False
+
+            frozen_components.append(attr)
+
+    return frozen_components
 
 
 def forward_teacher_student(
@@ -241,6 +294,13 @@ def run_kd_training(
     teacher_model.eval()
     teacher_model.to(device)
     student_model.to(device)
+
+    frozen_parts = freeze_student_vision_and_projector(student_model)
+    if frozen_parts:
+        print(
+            "Frozen student components (vision + projector): "
+            + ", ".join(sorted(set(frozen_parts)))
+        )
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
 

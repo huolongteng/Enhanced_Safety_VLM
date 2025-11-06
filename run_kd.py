@@ -1,13 +1,9 @@
 """Entry point for the knowledge-distillation training script."""
-
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
-
 import torch
 from transformers.utils import logging as hf_logging
-
 from dataset import create_policy_dataloader, gather_image_paths, load_policy_text
 from load_models import load_model_and_processor
 from train import (
@@ -34,7 +30,7 @@ NUM_EPOCHS = 30
 BATCH_SIZE = 1
 LEARNING_RATE = 7e-5
 DISTILL_TEMPERATURE = 2.0
-PROJECTOR_LOSS_WEIGHT = 0.6
+PROJECTOR_LOSS_WEIGHT = 0
 STEP_PLOT_STRIDE = 10
 IMAGE_SIZE = 256
 OUTPUT_DIR = Path(".")
