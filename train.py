@@ -9,6 +9,30 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.optimization import get_cosine_schedule_with_warmup
 
+
+@dataclass(frozen=True)
+class LoraAdapterSettings:
+    """Configuration wrapper for optional LoRA fine-tuning."""
+
+    enabled: bool = False
+    r: int = 8
+    alpha: int = 16
+    dropout: float = 0.05
+    bias: str = "none"
+    target_modules: tuple[str, ...] | None = None
+
+
+DEFAULT_LORA_TARGET_MODULES: tuple[str, ...] = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
 @dataclass
 class DistillationStats:
     """Container for metrics gathered during training."""
@@ -42,6 +66,39 @@ def _move_batch_to_device(batch, device):
         else:
             moved[key] = value
     return moved
+
+
+def apply_lora_adapters(
+    student_model,
+    settings: LoraAdapterSettings | None,
+):
+    """Wrap ``student_model`` with LoRA adapters when ``settings`` enable it."""
+
+    if settings is None or not settings.enabled:
+        return student_model
+
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as exc:  # pragma: no cover - guarded import
+        raise ImportError(
+            "LoRA fine-tuning requested but the `peft` package is not installed. "
+            "Install it with `pip install peft` to continue."
+        ) from exc
+
+    target_modules = settings.target_modules or DEFAULT_LORA_TARGET_MODULES
+
+    lora_config = LoraConfig(
+        r=settings.r,
+        lora_alpha=settings.alpha,
+        lora_dropout=settings.dropout,
+        bias=settings.bias,
+        target_modules=list(target_modules),
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    peft_model = get_peft_model(student_model, lora_config)
+    peft_model.print_trainable_parameters()
+    return peft_model
 
 
 def freeze_student_vision_and_projector(student_model) -> list[str]:
@@ -441,6 +498,40 @@ def save_training_artifacts(
     _save_step_plot(stats.step_losses, output_dir, step_stride)
 
     save_path = output_dir / checkpoint_name
+
+    if hasattr(student_model, "peft_config"):
+        adapter_dir = output_dir / "lora_adapter"
+        student_model.save_pretrained(adapter_dir)
+        print(f"Saved LoRA adapter weights to {adapter_dir.resolve()}")
+
+        merged_save_path = save_path
+        merged_model_dir = output_dir / "merged_student_model"
+
+        try:
+            merged_model = student_model.merge_and_unload()
+        except AttributeError:
+            merged_model = None
+
+        if merged_model is not None:
+            torch.save(merged_model.state_dict(), merged_save_path)
+            print(
+                "Saved merged student model parameters (LoRA applied) to "
+                f"{merged_save_path.resolve()}"
+            )
+
+            if hasattr(merged_model, "save_pretrained"):
+                merged_model.save_pretrained(merged_model_dir)
+                print(
+                    "Saved merged student model in Hugging Face format to "
+                    f"{merged_model_dir.resolve()}"
+                )
+            return
+
+        print(
+            "Warning: Unable to merge LoRA adapters into the base model. "
+            "Only adapter weights were saved."
+        )
+
     torch.save(student_model.state_dict(), save_path)
     print(f"Saved student model parameters to {save_path.resolve()}")
 

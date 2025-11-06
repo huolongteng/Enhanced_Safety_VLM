@@ -10,13 +10,13 @@ with open('policy.json', 'r') as f:
 # policy = "What is shown in the image? Provide a detailed description."
 import torch
 from transformers import AutoConfig
-config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
-model = LlavaOnevisionForConditionalGeneration(config)
-state_dict = torch.load("exp_1106/student_model_state.pt", map_location='cpu')
-model.load_state_dict(state_dict, strict=False)
+# config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
+# model = LlavaOnevisionForConditionalGeneration(config)
+# state_dict = torch.load("exp_1106_lora/student_model_state.pt", map_location='cpu')
+# model.load_state_dict(state_dict, strict=False)
 
 # model = LlavaOnevisionForConditionalGeneration.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
-# model = LlavaOnevisionForConditionalGeneration.from_pretrained(r"E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
+model = LlavaOnevisionForConditionalGeneration.from_pretrained(r"E:\models\LlavaGuard-v1.2-0.5B-OV-hf")
 model.eval()
 
 processor = AutoProcessor.from_pretrained('E:\models\llava-onevision-qwen2-0.5b-ov-hf')

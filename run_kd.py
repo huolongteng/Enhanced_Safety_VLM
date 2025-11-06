@@ -8,6 +8,8 @@ from dataset import create_policy_dataloader, gather_image_paths, load_policy_te
 from load_models import load_model_and_processor
 from train import (
     DistillationStats,
+    LoraAdapterSettings,
+    apply_lora_adapters,
     run_kd_training,
     save_training_artifacts,
     seed_everything,
@@ -26,7 +28,7 @@ TEACHER_MODEL_PATH = "E:/models/LlavaGuard-v1.2-0.5B-OV-hf"
 STUDENT_MODEL_PATH = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"
 POLICY_PATH = Path("policy.json")
 POLICY_INDEX = 0
-NUM_EPOCHS = 10
+NUM_EPOCHS = 3
 BATCH_SIZE = 1
 LEARNING_RATE = 7e-5
 DISTILL_TEMPERATURE = 2.0
@@ -35,6 +37,7 @@ STEP_PLOT_STRIDE = 10
 IMAGE_SIZE = 256
 OUTPUT_DIR = Path(".")
 SEED = 2025
+ENABLE_LORA = True
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class KDConfig:
     image_size: int = IMAGE_SIZE
     output_dir: Path = OUTPUT_DIR
     seed: int = SEED
+    enable_lora: bool = ENABLE_LORA
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,9 @@ def main(config: KDConfig | None = None) -> DistillationStats:
         batch_size=cfg.batch_size,
         image_size=cfg.image_size,
     )
+
+    lora_settings = LoraAdapterSettings(enabled=cfg.enable_lora)
+    student_model = apply_lora_adapters(student_model, lora_settings)
 
     stats = run_kd_training(
         teacher_model,

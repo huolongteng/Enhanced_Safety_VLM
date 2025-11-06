@@ -15,7 +15,7 @@ logging.set_verbosity_error()
 # Student model loading.
 # config = AutoConfig.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
 # model_student = LlavaOnevisionForConditionalGeneration(config)
-# state_dict = torch.load("exp_1104_50_epochs/student_model_state.pt", map_location='cpu')
+# state_dict = torch.load("exp_1106_lora/student_model_state.pt", map_location='cpu')
 # model_student.load_state_dict(state_dict, strict=False)
 model_student = LlavaOnevisionForConditionalGeneration.from_pretrained(r"E:\models\llava-onevision-qwen2-0.5b-ov-hf")
 # Teacher model loading.

@@ -10,3 +10,6 @@
 /exp_1106/
 /test_flashattn.py
 /verify_sha256.py
+/exp_1106_lora/
+/1106_lora_adapter/
+/1106_merged_student_model/
