@@ -333,7 +333,7 @@ def run_kd_training(
         desc="Training",
         unit="step" if total_steps is not None else "batch",
         dynamic_ncols=True,
-        leave=True,
+        leave=False,
     )
 
     for epoch in range(num_epochs):
