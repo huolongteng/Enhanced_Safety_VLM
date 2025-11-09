@@ -3,6 +3,8 @@ from PIL import Image
 import json
 from train_test_script import count_jpg_in_folder, get_dirs_with_jpg
 import random
+from transformers.utils import logging
+logging.set_verbosity_error()
 
 with open('policy.json', 'r') as f:
     policy = json.load(f)['policies'][0]
@@ -37,7 +39,7 @@ text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=
 folder_name = "tmp"
 count_jpg_in_folder(folder_name)
 image_paths = get_dirs_with_jpg(folder_name)
-random.seed(5678)
+random.seed(888)
 image_paths = random.sample(image_paths, min(1, len(image_paths)))
 
 image = Image.open(image_paths[0]).convert('RGB')
@@ -49,7 +51,7 @@ inputs = {k: v.to('cuda:0') for k, v in inputs.items()}
 hyperparameters = {
     "max_new_tokens": 200,
     "do_sample": True,
-    "temperature": 0.2,
+    "temperature": 1.0,
     "top_p": 0.95,
     "top_k": 50,
     "num_beams": 2,

@@ -8,6 +8,7 @@ from dataset import create_policy_dataloader, gather_image_paths, load_policy_te
 from load_models import load_model_and_processor
 from train import (
     DistillationStats,
+    EarlyStoppingConfig,
     LoraAdapterSettings,
     apply_lora_adapters,
     run_kd_training,
@@ -23,12 +24,12 @@ logging.set_verbosity_error()
 # ---------------------------------------------------------------------------
 
 IMAGE_FOLDER = "tmp"
-MAX_IMAGES = 200
+MAX_IMAGES = 1000
 TEACHER_MODEL_PATH = "E:/models/LlavaGuard-v1.2-0.5B-OV-hf"
 STUDENT_MODEL_PATH = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"
 POLICY_PATH = Path("policy.json")
 POLICY_INDEX = 0
-NUM_EPOCHS = 3
+NUM_EPOCHS = 20
 BATCH_SIZE = 1
 LEARNING_RATE = 7e-5
 DISTILL_TEMPERATURE = 2.0
@@ -38,6 +39,11 @@ IMAGE_SIZE = 256
 OUTPUT_DIR = Path(".")
 SEED = 2025
 ENABLE_LORA = True
+ENABLE_EARLY_STOPPING = True
+EARLY_STOPPING_PATIENCE = 2
+EARLY_STOPPING_MIN_DELTA = 0.0
+EARLY_STOPPING_MIN_EPOCHS = 1
+EARLY_STOPPING_RESTORE_BEST = True
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,11 @@ class KDConfig:
     output_dir: Path = OUTPUT_DIR
     seed: int = SEED
     enable_lora: bool = ENABLE_LORA
+    enable_early_stopping: bool = ENABLE_EARLY_STOPPING
+    early_stopping_patience: int = EARLY_STOPPING_PATIENCE
+    early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA
+    early_stopping_min_epochs: int = EARLY_STOPPING_MIN_EPOCHS
+    early_stopping_restore_best: bool = EARLY_STOPPING_RESTORE_BEST
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +108,14 @@ def main(config: KDConfig | None = None) -> DistillationStats:
     lora_settings = LoraAdapterSettings(enabled=cfg.enable_lora)
     student_model = apply_lora_adapters(student_model, lora_settings)
 
+    early_stopping_cfg = EarlyStoppingConfig(
+        enabled=cfg.enable_early_stopping,
+        patience=cfg.early_stopping_patience,
+        min_delta=cfg.early_stopping_min_delta,
+        min_epochs=cfg.early_stopping_min_epochs,
+        restore_best_weights=cfg.early_stopping_restore_best,
+    )
+
     stats = run_kd_training(
         teacher_model,
         student_model,
@@ -106,6 +125,7 @@ def main(config: KDConfig | None = None) -> DistillationStats:
         temperature=cfg.distill_temperature,
         num_epochs=cfg.num_epochs,
         projector_loss_weight=cfg.projector_loss_weight,
+        early_stopping=early_stopping_cfg,
     )
 
     save_training_artifacts(

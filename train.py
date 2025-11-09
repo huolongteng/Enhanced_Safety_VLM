@@ -15,9 +15,9 @@ class LoraAdapterSettings:
     """Configuration wrapper for optional LoRA fine-tuning."""
 
     enabled: bool = False
-    r: int = 8
+    r: int = 16
     alpha: int = 16
-    dropout: float = 0.05
+    dropout: float = 0.03
     bias: str = "none"
     target_modules: tuple[str, ...] | None = None
 
@@ -35,10 +35,47 @@ DEFAULT_LORA_TARGET_MODULES: tuple[str, ...] = (
 
 @dataclass
 class DistillationStats:
-    """Container for metrics gathered during training."""
+    """Container for metrics gathered during training.
+
+    Attributes
+    ----------
+    epoch_losses:
+        Average loss value computed at the end of each epoch.
+    step_losses:
+        Raw loss values recorded after every optimization step.
+    best_epoch:
+        The 1-based index of the epoch that achieved the lowest observed loss
+        when early stopping is enabled.  ``None`` when no improvement was
+        recorded or the heuristic is disabled.
+    best_loss:
+        The best average loss encountered throughout training.  ``None`` when
+        the training loop never logged a finite value (e.g. empty dataloader).
+    early_stopped:
+        ``True`` when the early-stopping heuristic terminated the loop before
+        exhausting ``num_epochs``.
+    """
 
     epoch_losses: list[float]
     step_losses: list[float]
+    best_epoch: int | None = None
+    best_loss: float | None = None
+    early_stopped: bool = False
+
+
+@dataclass(frozen=True)
+class EarlyStoppingConfig:
+    """Parameters that control the optional early-stopping heuristic.
+
+    The defaults follow a conventional setup where training stops after two
+    consecutive non-improving epochs while automatically restoring the best
+    checkpoint observed so far.
+    """
+
+    enabled: bool = False
+    patience: int = 2
+    min_delta: float = 0.0
+    min_epochs: int = 1
+    restore_best_weights: bool = True
 
 
 def seed_everything(seed: int) -> None:
@@ -345,8 +382,26 @@ def run_kd_training(
     temperature: float,
     num_epochs: int,
     projector_loss_weight: float = 1.0,
+    early_stopping: EarlyStoppingConfig | None = None,
 ) -> DistillationStats:
-    """Train ``student_model`` to mimic ``teacher_model`` using ``dataloader``."""
+    """Train ``student_model`` to mimic ``teacher_model`` using ``dataloader``.
+
+    Parameters
+    ----------
+    teacher_model, student_model:
+        Hugging Face compatible causal language models participating in the
+        knowledge distillation process.
+    dataloader:
+        Iterable that yields tokenized batches for training.
+    device:
+        Hardware accelerator on which the models should be executed.
+    learning_rate, temperature, num_epochs, projector_loss_weight:
+        Hyper-parameters controlling the optimization dynamics.
+    early_stopping:
+        Optional configuration structure.  When provided and enabled the
+        training loop monitors the epoch loss and halts once the patience
+        threshold is exhausted.
+    """
 
     teacher_model.eval()
     teacher_model.to(device)
@@ -393,6 +448,16 @@ def run_kd_training(
         leave=False,
     )
 
+    # Prepare bookkeeping variables required for early stopping.  When the
+    # heuristic is disabled we simply leave ``early_cfg`` as ``None`` so that
+    # the training loop incurs no additional overhead.
+    early_cfg = early_stopping if early_stopping and early_stopping.enabled else None
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    best_epoch: int | None = None
+    epochs_without_improve = 0
+    stopped_early = False
+
     for epoch in range(num_epochs):
         student_model.train()
         running_loss = 0.0
@@ -437,9 +502,54 @@ def run_kd_training(
         if total_steps is None:
             progress_bar.refresh()
 
+        if early_cfg is not None:
+            # Determine whether the current epoch improved upon the best loss by
+            # at least ``min_delta``.  Improvements reset the patience counter
+            # and optionally store a CPU copy of the student weights so the best
+            # checkpoint can be restored after the loop terminates.
+            if average_loss + early_cfg.min_delta < best_loss:
+                best_loss = average_loss
+                best_epoch = epoch
+                epochs_without_improve = 0
+                if early_cfg.restore_best_weights:
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in student_model.state_dict().items()
+                    }
+            else:
+                epochs_without_improve += 1
+
+            # Once the patience budget is exceeded and the minimum epoch
+            # requirement is satisfied we stop training early.  The message is
+            # printed via the progress bar so it appears alongside the other
+            # training logs.
+            if (
+                (epoch + 1) >= max(1, early_cfg.min_epochs)
+                and epochs_without_improve >= max(1, early_cfg.patience)
+            ):
+                progress_bar.write(
+                    "Early stopping triggered: no improvement for "
+                    f"{epochs_without_improve} epoch(s). Best loss "
+                    f"{best_loss:.4f} observed at epoch {best_epoch + 1 if best_epoch is not None else 'N/A'}."
+                )
+                stopped_early = True
+                break
+
     progress_bar.close()
 
-    return DistillationStats(epoch_losses=epoch_losses, step_losses=step_losses)
+    if early_cfg is not None and early_cfg.restore_best_weights and best_state is not None:
+        # Restoring the best-performing checkpoint ensures downstream uses such
+        # as artifact saving export the most effective model rather than the one
+        # from the final (possibly suboptimal) epoch.
+        student_model.load_state_dict(best_state)
+
+    return DistillationStats(
+        epoch_losses=epoch_losses,
+        step_losses=step_losses,
+        best_epoch=None if best_epoch is None else best_epoch + 1,
+        best_loss=None if best_loss == float("inf") else best_loss,
+        early_stopped=stopped_early,
+    )
 
 
 def _save_epoch_plot(epoch_losses: Sequence[float], output_dir: Path) -> None:
