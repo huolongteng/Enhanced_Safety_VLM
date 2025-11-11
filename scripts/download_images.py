@@ -14,7 +14,25 @@ Example usage::
     python scripts/download_images.py --datasets train
 
 If an image cannot be downloaded (e.g. due to an invalid URL or network
-error) it will be skipped gracefully.
+error) it will be skipped gracefully. For gated resources on Hugging Face,
+you must supply an access token that starts with ``hf_`` (for example,
+``hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx``). There are three interchangeable
+ways to provide the token:
+
+* Run ``huggingface-cli login`` once. The credential is stored in the local
+  Hugging Face cache and will be picked up automatically.
+* Export the ``HF_TOKEN`` (or ``HUGGINGFACE_TOKEN``) environment variable
+  before running this script, for example::
+
+      export HF_TOKEN="hf_your_personal_access_token"
+      python scripts/download_images.py
+
+* Pass the token explicitly with ``--token`` when invoking the script::
+
+      python scripts/download_images.py --token hf_your_personal_access_token
+
+When a valid token is present the script automatically authenticates the
+``requests`` session so gated downloads succeed.
 """
 
 from __future__ import annotations
@@ -22,10 +40,16 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+try:
+    from huggingface_hub import HfFolder
+except ImportError:  # pragma: no cover - optional dependency
+    HfFolder = None  # type: ignore
 
 
 CHUNK_SIZE = 8192
@@ -75,10 +99,48 @@ def download_image(session: requests.Session, url: str, destination: Path) -> bo
     return True
 
 
+def resolve_auth_token(override: Optional[str] = None) -> Optional[str]:
+    """Return an access token for gated resources if available."""
+
+    if override:
+        return override.strip() or None
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    if token:
+        return token.strip() or None
+
+    if HfFolder is not None:  # pragma: no branch - simple retrieval
+        try:
+            stored_token = HfFolder.get_token()
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.debug("Unable to load Hugging Face token: %s", exc)
+        else:
+            if stored_token:
+                return stored_token.strip() or None
+
+    return None
+
+
+def create_session(token: Optional[str] = None) -> requests.Session:
+    """Create an HTTP session configured for dataset downloads."""
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "EnhancedSafetyVLM/1.0"})
+
+    token = resolve_auth_token(token)
+    if token:
+        session.headers["Authorization"] = f"Bearer {token}"
+        session.cookies.set("token", token, domain="huggingface.co")
+        logging.info("Using Hugging Face authentication token for downloads.")
+
+    return session
+
+
 def process_dataset(
     csv_path: Path,
     output_dir: Path,
     failure_records: List[Dict[str, str]],
+    token: Optional[str] = None,
 ) -> Tuple[int, int]:
     """Download all images defined in a CSV dataset.
 
@@ -107,9 +169,7 @@ def process_dataset(
             logging.error("CSV file %s is missing required columns.", csv_path)
             return (0, 0)
 
-        with requests.Session() as session:
-            session.headers.update({"User-Agent": "EnhancedSafetyVLM/1.0"})
-
+        with create_session(token) as session:
             for row in reader:
                 image_id = (row.get("id") or "").strip()
                 url = (row.get("url") or "").strip()
@@ -176,6 +236,14 @@ def parse_args() -> argparse.Namespace:
             "Defaults to data/failed_downloads.csv inside the data directory."
         ),
     )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help=(
+            "Hugging Face access token for authenticated downloads. Overrides "
+            "environment variables and stored credentials."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -195,7 +263,12 @@ def write_failure_log(failure_log: Path, records: List[Dict[str, str]]) -> None:
     logging.info("Recorded %d failed downloads to %s", len(records), failure_log)
 
 
-def main(datasets: Iterable[str], data_dir: Path, failure_log: Path) -> None:
+def main(
+    datasets: Iterable[str],
+    data_dir: Path,
+    failure_log: Path,
+    token: Optional[str] = None,
+) -> None:
     total_downloaded = 0
     total_skipped = 0
     failure_records: List[Dict[str, str]] = []
@@ -205,7 +278,9 @@ def main(datasets: Iterable[str], data_dir: Path, failure_log: Path) -> None:
         output_dir = data_dir / dataset
 
         logging.info("Processing dataset '%s'", dataset)
-        downloaded, skipped = process_dataset(csv_path, output_dir, failure_records)
+        downloaded, skipped = process_dataset(
+            csv_path, output_dir, failure_records, token
+        )
         total_downloaded += downloaded
         total_skipped += skipped
 
@@ -226,4 +301,4 @@ if __name__ == "__main__":
     configure_logging()
     args = parse_args()
     failure_log = args.failure_log or (args.data_dir / "failed_downloads.csv")
-    main(args.datasets, args.data_dir, failure_log)
+    main(args.datasets, args.data_dir, failure_log, args.token)
