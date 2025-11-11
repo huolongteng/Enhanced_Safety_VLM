@@ -19,3 +19,6 @@
 /1110_lora_adapter/
 /1110_merged_student_model/
 /exp_1110_lora/
+/data/test/
+/data/train/
+/data/failed_downloads.csv
