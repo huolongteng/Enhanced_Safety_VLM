@@ -23,7 +23,7 @@ import argparse
 import csv
 import logging
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import requests
 
@@ -75,7 +75,11 @@ def download_image(session: requests.Session, url: str, destination: Path) -> bo
     return True
 
 
-def process_dataset(csv_path: Path, output_dir: Path) -> Tuple[int, int]:
+def process_dataset(
+    csv_path: Path,
+    output_dir: Path,
+    failure_records: List[Dict[str, str]],
+) -> Tuple[int, int]:
     """Download all images defined in a CSV dataset.
 
     Args:
@@ -103,31 +107,45 @@ def process_dataset(csv_path: Path, output_dir: Path) -> Tuple[int, int]:
             logging.error("CSV file %s is missing required columns.", csv_path)
             return (0, 0)
 
-        session = requests.Session()
-        session.headers.update({"User-Agent": "EnhancedSafetyVLM/1.0"})
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "EnhancedSafetyVLM/1.0"})
 
-        for row in reader:
-            image_id = (row.get("id") or "").strip()
-            url = (row.get("url") or "").strip()
+            for row in reader:
+                image_id = (row.get("id") or "").strip()
+                url = (row.get("url") or "").strip()
 
-            if not image_id or not url:
-                logging.warning(
-                    "Skipping row with missing id/url in %s: %s", csv_path.name, row
-                )
-                skipped += 1
-                continue
+                if not image_id or not url:
+                    logging.warning(
+                        "Skipping row with missing id/url in %s: %s", csv_path.name, row
+                    )
+                    skipped += 1
+                    failure_records.append(
+                        {
+                            "csv_file": csv_path.name,
+                            "id": image_id or row.get("id", ""),
+                            "url": url or row.get("url", ""),
+                        }
+                    )
+                    continue
 
-            destination = output_dir / image_id
+                destination = output_dir / image_id
 
-            if destination.exists():
-                logging.info("Image already exists, skipping: %s", destination)
-                skipped += 1
-                continue
+                if destination.exists():
+                    logging.info("Image already exists, skipping: %s", destination)
+                    skipped += 1
+                    continue
 
-            if download_image(session, url, destination):
-                downloaded += 1
-            else:
-                skipped += 1
+                if download_image(session, url, destination):
+                    downloaded += 1
+                else:
+                    skipped += 1
+                    failure_records.append(
+                        {
+                            "csv_file": csv_path.name,
+                            "id": image_id,
+                            "url": url,
+                        }
+                    )
 
     return downloaded, skipped
 
@@ -149,19 +167,45 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Root directory containing the CSV files and where images will be stored.",
     )
+    parser.add_argument(
+        "--failure-log",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a CSV file where failed downloads will be recorded. "
+            "Defaults to data/failed_downloads.csv inside the data directory."
+        ),
+    )
     return parser.parse_args()
 
 
-def main(datasets: Iterable[str], data_dir: Path) -> None:
+def write_failure_log(failure_log: Path, records: List[Dict[str, str]]) -> None:
+    """Persist failed download information to disk."""
+
+    if not records:
+        logging.info("No failed downloads detected.")
+        return
+
+    failure_log.parent.mkdir(parents=True, exist_ok=True)
+    with failure_log.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=("csv_file", "id", "url"))
+        writer.writeheader()
+        writer.writerows(records)
+
+    logging.info("Recorded %d failed downloads to %s", len(records), failure_log)
+
+
+def main(datasets: Iterable[str], data_dir: Path, failure_log: Path) -> None:
     total_downloaded = 0
     total_skipped = 0
+    failure_records: List[Dict[str, str]] = []
 
     for dataset in datasets:
         csv_path = data_dir / f"{dataset}.csv"
         output_dir = data_dir / dataset
 
         logging.info("Processing dataset '%s'", dataset)
-        downloaded, skipped = process_dataset(csv_path, output_dir)
+        downloaded, skipped = process_dataset(csv_path, output_dir, failure_records)
         total_downloaded += downloaded
         total_skipped += skipped
 
@@ -175,9 +219,11 @@ def main(datasets: Iterable[str], data_dir: Path) -> None:
     logging.info(
         "All datasets complete: %d downloaded, %d skipped", total_downloaded, total_skipped
     )
+    write_failure_log(failure_log, failure_records)
 
 
 if __name__ == "__main__":
     configure_logging()
     args = parse_args()
-    main(args.datasets, args.data_dir)
+    failure_log = args.failure_log or (args.data_dir / "failed_downloads.csv")
+    main(args.datasets, args.data_dir, failure_log)
