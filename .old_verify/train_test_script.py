@@ -1,0 +1,430 @@
+# This block is for creating Dataset and Dataloader.
+policy = """
+Provide a safety assessment for the content provided by the user. Determine compliance or violation against our safety policy by reviewing the following policy categories:
+O1: Hate, Humiliation, Harassment:
+Should not:
+- Contain content that expresses hateful, derogatory, or demeaning sentiments against people based on sensitive personal characteristics like their race, color, religion, national origin, sexual orientation, gender, gender identity, or disability.
+- Contain content that encourages discrimination or harassment against people based on those characteristics.
+Can:
+- Contain educational content that provides information on discrimination, humiliation, and harassment.
+- Discuss historical events involving hate and harassment.
+
+O2: Violence, Harm, or Cruelty:
+Should not:
+- Contain content of people planning or engaging in violence.
+- Contain content that encourages people to engage in violence or cruelty, including harm to others.
+Can:
+- Contain educational content that provides information on violence, harm, and cruelty.
+- Discuss historical events involving violence and cruelty.
+
+O3: Sexual Content:
+Should not:
+- Contain sexually explicit (i.e., erotic) content.
+Can:
+- Contain content that is related to sexuality and sexual education.
+- Provide general information regarding sexual activities.
+- Provide guidance on topics related to sexual health.
+- Contain content of people in a loving and affectionate manner if it is not sexually explicit content.
+
+O4: Nudity Content:
+Should not:
+- Contain visible genitalia (e.g., exposed breast, nipple, vagina, vulva, or penis) or explicit nudity content.
+Can:
+- Contain artistic nudity if the content does not include visible genitalia.
+- Contain educational content and general information on the human body.
+- Provide guidance on topics related to sexual health.
+
+O5: Criminal Planning:
+Should not:
+- Contain content of people planning or engaging in criminal activities like theft, kidnapping, or financial crimes.
+- Contain content that encourages people to engage in criminal activities or condone criminal behavior.
+Can:
+- Contain content that helps people understand how crimes are committed, provided that the content is not so detailed that it could be used to provide a roadmap for future crimes.
+- Contain content that educates on crime prevention and understanding criminal behavior without providing guidance for criminal activities.
+
+O6: Weapons or Substance Abuse:
+Should not:
+- Contain content of illegal weapons with the intent to promote violence or harm.
+- Contain content of trafficking, consumption, or use of illegal drugs.
+- Promote the use of tobacco, alcohol, and cannabis.
+- Contain content about the creation or production of illegal substances.
+Can:
+- Contain weapons used in a legal and safe context without any indication of violence or intent to harm.
+- Discussions on firearm ownership and educational content on regulated substances without promoting illegal activities.
+- Contain content that provides factual information about legal drugs, including their effects and chemical composition, without promoting their use.
+- Contain content that offers educational insights into the manufacturing processes of substances, ensuring that such information is general and does not include detailed instructions that could facilitate their production.
+
+O7: Self-Harm:
+Should not:
+- Contain content that could encourage people to harm themselves.
+- Contain content that romanticizes or condones self-harm or suicide.
+Can:
+- Contain educational content that informs about the prevalence, causes, and effects of self-harm and suicide, such as statistical data and discussions on mental health challenges.
+- Contain resources and information that guide individuals toward professional help and support services for mental health, self-harm, and suicide prevention.
+
+O8: Animal Cruelty:
+Should not:
+- Contain content that could encourage people to harm animals.
+- Contain content that romanticizes or condones harming animals.
+- Contain explicit animal cruelty.
+Can:
+- Contain content that provides general information regarding animal cruelty.
+
+O9: Disasters or Emergencies:
+Should not:
+- Contain content about individuals who are deceased or have suffered harm as a result of disasters or emergencies.
+- Contain content about suffering, cruelty, or exploitation of individuals during such events.
+Can:
+- Contain respectful news coverage and reports on emergencies, prioritizing informational value over sensationalism.
+- Contain educational content that provides factual information on historical and current disasters or emergencies.
+
+Assessment Steps:
+1. Select a safety "rating". This should be "Unsafe" if the content violates the safety policy; otherwise, it should be "Safe".
+2. Assign a policy "category". If none of the policy categories are applicable, select "NA: None applying".
+3. Provide a "rationale". Describe the user content and justify why it is considered safe or unsafe, referring to the specific policy category and its associated guidelines to illustrate any violations or compliance.
+To provide your assessment use the following json template:
+{
+    "rating": str<"Unsafe"|"Safe">,
+    "category": str<"O1: Hate, Humiliation, Harassment"|"O2: Violence, Harm, or Cruelty"|"O3: Sexual Content"|"O4: Nudity Content"|"O5: Criminal Planning"|"O6: Weapons or Substance Abuse"|"O7: Self-Harm"|"O8: Animal Cruelty"|"O9: Disasters or Emergencies"|"NA: None applying">,
+    "rationale": str,
+}
+"""
+# policy = "What is the safety assessment for the image provided?"
+
+from pathlib import Path
+
+# This function counts the number of .jpg files in the indicated folder.
+def count_jpg_in_folder(folder_name):
+    base_dir = Path(__file__).parent
+    tmp_dir = base_dir / folder_name
+    if not tmp_dir.exists() or not tmp_dir.is_dir():
+        print(f"`{tmp_dir} not exists or is not a directory.`")
+        return 0
+    count = sum(1 for p in tmp_dir.iterdir() if p.is_file() and p.suffix.lower() == ".jpg")
+    print(f"Found {count} .jpg files in `{tmp_dir}`.")
+    return count
+
+from typing import Any, Callable, List, Optional, Sequence
+
+
+def get_dirs_with_jpg(base_folder_name):
+    """
+    Returns a list of the absolute paths of all '.jpg' or '.jpeg' image files
+    (recursively) under `base_folder_name`.
+    """
+    base_dir = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+    target_dir = base_dir / base_folder_name
+    if not target_dir.exists() or not target_dir.is_dir():
+        print(f"`{target_dir}` does not exist or is not a directory.")
+        return []
+
+    image_paths: List[str] = []
+    for p in target_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg"):
+            image_paths.append(str(p.resolve()))
+
+    print(f"Found {len(image_paths)} .jpg/.jpeg files under `{target_dir}`.")
+    return image_paths
+
+from torch.utils.data import Dataset
+from PIL import Image
+from torchvision import transforms
+from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
+
+# This Dataset class loads images and prepares them with the given policy prompt.
+class PolicyImageDataset(Dataset):
+    def __init__(self, image_paths, policy, image_size=256):
+        self.image_paths = image_paths
+        self.policy = policy
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+        ])
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        image = self.transform(image)
+        return {
+            "image": image,
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": self.policy},
+                    ],
+                },
+            ],
+        }
+
+from torch.utils.data import DataLoader
+
+# This block is about defining Loss function.
+import torch
+import torch.nn.functional as F
+
+def apply_chat_template_to_batch(
+    conversations,
+    processor,
+    add_generation_prompt: bool = True,
+):
+    """Apply the chat template to a batch of conversations."""
+
+    return [
+        processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        for conversation in conversations
+    ]
+
+
+def build_policy_collate_fn(
+    processor,
+    *,
+    add_generation_prompt: bool = True,
+    padding: bool = True,
+    return_tensors: str = "pt",
+    **processor_kwargs: Any,
+) -> Callable[[Sequence[dict]], dict]:
+    """Create a collate function that batches samples with the processor."""
+
+    def collate_fn(batch: Sequence[dict]) -> dict:
+        if not batch:
+            raise ValueError("Received an empty batch.")
+
+        images = [sample["image"] for sample in batch]
+        conversations = [sample["conversation"] for sample in batch]
+        prompts = apply_chat_template_to_batch(
+            conversations,
+            processor,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+        return processor(
+            text=prompts,
+            images=images,
+            padding=padding,
+            return_tensors=return_tensors,
+            **processor_kwargs,
+        )
+
+    return collate_fn
+
+def load_model_and_processor(teacher_path, student_path):
+    t_ = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
+    s_ = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
+    p_ = AutoProcessor.from_pretrained(teacher_path, use_fast=True)
+    t_.config.sliding_window = False
+    s_.config.sliding_window = False
+    return t_, s_, p_
+
+def _move_batch_to_device(batch, device):
+    """Move every tensor in ``batch`` to ``device``."""
+    if device is None:
+        return batch
+
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in batch.items()
+    }
+
+
+def forward_teacher_student(
+    teacher_model,
+    student_model,
+    batch,
+    device,
+):
+    """Run a forward pass for both teacher and student on ``batch``.
+    """
+    model_inputs = _move_batch_to_device(batch, device)
+
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**model_inputs)
+
+    student_outputs = student_model(**model_inputs)
+    return teacher_outputs, student_outputs, model_inputs
+
+def compute_kd_loss(
+    student_logits,
+    teacher_logits,
+    attention_mask,
+    temperature: float = 1.0,
+):
+    """Compute the standard KL-divergence loss for knowledge distillation."""
+
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+    student_log_probs = student_log_probs.view(-1, student_log_probs.size(-1))
+    teacher_probs = teacher_probs.view(-1, teacher_probs.size(-1))
+
+    if attention_mask is not None:
+        flat_mask = attention_mask.view(-1).bool()
+        if flat_mask.any():
+            student_log_probs = student_log_probs[flat_mask]
+            teacher_probs = teacher_probs[flat_mask]
+        else:
+            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
+
+    kd = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
+    return kd * (temperature**2)
+
+
+# This block is about training process.
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+def distillation_step(
+    teacher_model,
+    student_model,
+    optimizer,
+    batch,
+    device,
+    temperature: float = 1.0,
+):
+    """Perform a single optimization step using knowledge distillation."""
+
+    teacher_outputs, student_outputs, model_inputs = forward_teacher_student(
+        teacher_model, student_model, batch, device
+    )
+
+    attention_mask = model_inputs.get("attention_mask")
+
+    loss = compute_kd_loss(
+        student_outputs.logits, teacher_outputs.logits, attention_mask, temperature
+    )
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+
+
+# Set random seed.
+import random
+def same_seeds(seed=443):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+same_seeds(2025)
+
+
+
+if __name__ == "__main__":
+    # Test.
+
+    # Filter out warnings.
+    from transformers.utils import logging
+    logging.set_verbosity_error()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    folder_name = "tmp"
+    count_jpg_in_folder(folder_name)
+    image_paths = get_dirs_with_jpg(folder_name)
+
+    image_paths = random.sample(image_paths, min(100, len(image_paths)))
+
+    teacher_model, student_model, processor = load_model_and_processor(
+        "E:\models\LlavaGuard-v1.2-0.5B-OV-hf", "E:\models\llava-onevision-qwen2-0.5b-ov-hf"
+    )
+    dataset = PolicyImageDataset(image_paths, policy)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=build_policy_collate_fn(processor),
+    )
+
+    teacher_model.eval()
+    teacher_model.to(device)
+    student_model.to(device)
+
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=7e-5)
+    num_epochs = 50
+    epoch_losses = []
+    step_losses: List[float] = []
+    global_step = 0
+    distill_temperature = 2.0
+
+    for epoch in range(num_epochs):
+        student_model.train()
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        running_loss = 0.0
+        num_batches = 0
+
+        for batch in progress_bar:
+            loss = distillation_step(
+                teacher_model,
+                student_model,
+                optimizer,
+                batch,
+                device=device,
+                temperature=distill_temperature,
+            )
+            running_loss += loss
+            num_batches += 1
+            global_step += 1
+            step_losses.append(loss)
+            progress_bar.set_postfix({
+                "loss": f"{loss:.4f}",
+                "step": global_step,
+            })
+
+        average_loss = running_loss / max(num_batches, 1)
+        epoch_losses.append(average_loss)
+        tqdm.write(f"Epoch {epoch + 1}: average_loss={average_loss:.4f}")
+
+    epochs = range(1, num_epochs + 1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, epoch_losses, marker="o", label="Epoch Avg Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Average Loss")
+    plt.title("Knowledge Distillation Training Loss (Epoch)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    epoch_plot_path = Path("loss_curve_epoch.png")
+    plt.savefig(epoch_plot_path)
+    plt.close()
+    print(f"Saved epoch loss curve to {epoch_plot_path.resolve()}")
+
+    if step_losses:
+        steps = range(1, len(step_losses) + 1)
+        stride = 10  # Plot every 50 steps to reduce clutter.
+        steps_plot = steps[::stride]
+        losses_plot = step_losses[::stride]
+        plt.figure(figsize=(8, 5))
+        plt.plot(steps_plot, losses_plot, label=f"Step Loss (every {stride})")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.title("Knowledge Distillation Training Loss (Step)")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        step_plot_path = Path("loss_curve_step.png")
+        plt.savefig(step_plot_path)
+        plt.close()
+        print(f"Saved step loss curve to {step_plot_path.resolve()}")
+
+    save_path = Path("student_model_state.pt")
+    torch.save(student_model.state_dict(), save_path)
+    print(f"Saved student model parameters to {save_path.resolve()}")
+
+
+
