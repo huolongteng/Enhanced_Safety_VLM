@@ -14,10 +14,14 @@ Example usage::
     python scripts/download_images.py --datasets train
 
 If an image cannot be downloaded (e.g. due to an invalid URL or network
-error) it will be skipped gracefully. For gated resources on Hugging Face,
-you must supply an access token that starts with ``hf_`` (for example,
-``hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx``). There are three interchangeable
-ways to provide the token:
+error) it will be skipped gracefully. The downloader rotates realistic
+browser headers, retries transient HTTP errors with exponential backoff, and
+supports optional randomized delays between requests to reduce the likelihood
+of triggering anti-scraping systems.
+
+For gated resources on Hugging Face, you must supply an access token that
+starts with ``hf_`` (for example, ``hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx``).
+There are three interchangeable ways to provide the token:
 
 * Run ``huggingface-cli login`` once. The credential is stored in the local
   Hugging Face cache and will be picked up automatically.
@@ -41,10 +45,15 @@ import argparse
 import csv
 import logging
 import os
+import random
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from huggingface_hub import HfFolder
@@ -53,7 +62,28 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 CHUNK_SIZE = 8192
+DEFAULT_TIMEOUT = 20
 DEFAULT_DATASETS = ("train", "test")
+
+# A small pool of modern browser user-agents to rotate between so requests do not
+# all share the same easily blocked crawler signature. The list intentionally
+# mirrors popular desktop browsers.
+ROTATING_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+)
+
+# Commonly accepted headers to accompany the randomized user-agent and better
+# mimic typical browser requests.
+BASE_REQUEST_HEADERS: Dict[str, str] = {
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 
 def configure_logging() -> None:
@@ -65,7 +95,26 @@ def configure_logging() -> None:
     )
 
 
-def download_image(session: requests.Session, url: str, destination: Path) -> bool:
+def _build_request_headers(url: str) -> Dict[str, str]:
+    """Create per-request headers with a rotated user-agent and referer."""
+
+    headers = dict(BASE_REQUEST_HEADERS)
+    headers["User-Agent"] = random.choice(ROTATING_USER_AGENTS)
+
+    parsed = urlsplit(url)
+    if parsed.scheme and parsed.netloc:
+        referer = f"{parsed.scheme}://{parsed.netloc}"
+        headers["Referer"] = referer
+
+    return headers
+
+
+def download_image(
+    session: requests.Session,
+    url: str,
+    destination: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> bool:
     """Download a single image.
 
     Args:
@@ -78,7 +127,12 @@ def download_image(session: requests.Session, url: str, destination: Path) -> bo
     """
 
     try:
-        response = session.get(url, timeout=15, stream=True)
+        response = session.get(
+            url,
+            timeout=timeout,
+            stream=True,
+            headers=_build_request_headers(url),
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         logging.warning("Failed to download %s: %s", url, exc)
@@ -125,13 +179,26 @@ def create_session(token: Optional[str] = None) -> requests.Session:
     """Create an HTTP session configured for dataset downloads."""
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "EnhancedSafetyVLM/1.0"})
 
     token = resolve_auth_token(token)
     if token:
         session.headers["Authorization"] = f"Bearer {token}"
         session.cookies.set("token", token, domain="huggingface.co")
         logging.info("Using Hugging Face authentication token for downloads.")
+
+    retry = Retry(
+        total=4,
+        status=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
     return session
 
@@ -141,6 +208,10 @@ def process_dataset(
     output_dir: Path,
     failure_records: List[Dict[str, str]],
     token: Optional[str] = None,
+    *,
+    min_delay: float = 0.0,
+    max_delay: float = 0.0,
+    timeout: int = DEFAULT_TIMEOUT,
 ) -> Tuple[int, int]:
     """Download all images defined in a CSV dataset.
 
@@ -150,8 +221,8 @@ def process_dataset(
 
     Returns:
         A tuple ``(downloaded, skipped)`` with the number of successfully
-        downloaded images and the number of entries skipped due to
-        errors or missing data.
+        downloaded images and the number of entries skipped due to errors,
+        missing data, or repeated files.
     """
 
     if not csv_path.exists():
@@ -195,7 +266,7 @@ def process_dataset(
                     skipped += 1
                     continue
 
-                if download_image(session, url, destination):
+                if download_image(session, url, destination, timeout=timeout):
                     downloaded += 1
                 else:
                     skipped += 1
@@ -206,6 +277,11 @@ def process_dataset(
                             "url": url,
                         }
                     )
+
+                if max_delay > 0:
+                    delay = random.uniform(min_delay, max_delay)
+                    if delay > 0:
+                        time.sleep(delay)
 
     return downloaded, skipped
 
@@ -244,6 +320,30 @@ def parse_args() -> argparse.Namespace:
             "environment variables and stored credentials."
         ),
     )
+    parser.add_argument(
+        "--min-delay",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum delay in seconds between downloads. Use together with --max-delay "
+            "to introduce random pauses that mimic human browsing patterns."
+        ),
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum delay in seconds between downloads. Values greater than zero "
+            "enable randomized throttling."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help="Per-request timeout in seconds. Increase if downloading large files.",
+    )
     return parser.parse_args()
 
 
@@ -268,7 +368,25 @@ def main(
     data_dir: Path,
     failure_log: Path,
     token: Optional[str] = None,
+    *,
+    min_delay: float = 0.0,
+    max_delay: float = 0.0,
+    timeout: int = DEFAULT_TIMEOUT,
 ) -> None:
+    min_delay = max(min_delay, 0.0)
+    max_delay = max(max_delay, 0.0)
+
+    if max_delay and max_delay < min_delay:
+        logging.warning(
+            "Max delay %.2fs is smaller than min delay %.2fs; swapping values.",
+            max_delay,
+            min_delay,
+        )
+        min_delay, max_delay = max_delay, min_delay
+
+    if min_delay > 0 and max_delay == 0:
+        max_delay = min_delay
+
     total_downloaded = 0
     total_skipped = 0
     failure_records: List[Dict[str, str]] = []
@@ -279,7 +397,13 @@ def main(
 
         logging.info("Processing dataset '%s'", dataset)
         downloaded, skipped = process_dataset(
-            csv_path, output_dir, failure_records, token
+            csv_path,
+            output_dir,
+            failure_records,
+            token,
+            min_delay=min_delay,
+            max_delay=max_delay,
+            timeout=timeout,
         )
         total_downloaded += downloaded
         total_skipped += skipped
@@ -301,4 +425,12 @@ if __name__ == "__main__":
     configure_logging()
     args = parse_args()
     failure_log = args.failure_log or (args.data_dir / "failed_downloads.csv")
-    main(args.datasets, args.data_dir, failure_log, args.token)
+    main(
+        args.datasets,
+        args.data_dir,
+        failure_log,
+        args.token,
+        min_delay=args.min_delay,
+        max_delay=args.max_delay,
+        timeout=args.timeout,
+    )
