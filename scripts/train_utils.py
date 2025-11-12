@@ -181,8 +181,9 @@ def forward_teacher_student(teacher_model, student_model, batch, device):
 
     student_outputs = student_model(**model_inputs)
     labels = model_inputs.get("labels")
+    attention_mask = model_inputs.get("attention_mask")
 
-    return teacher_outputs, student_outputs, teacher_inputs, labels
+    return teacher_outputs, student_outputs, attention_mask, labels
 
 
 def compute_kd_loss(
@@ -326,14 +327,18 @@ def distillation_step(
 ) -> float:
     """Perform a single optimization step of supervised knowledge distillation."""
 
-    teacher_outputs, student_outputs, model_inputs, labels = forward_teacher_student(
+    (
+        teacher_outputs,
+        student_outputs,
+        attention_mask,
+        labels,
+    ) = forward_teacher_student(
         teacher_model,
         student_model,
         batch,
         device,
     )
 
-    attention_mask = model_inputs.get("attention_mask")
     kd_loss = compute_kd_loss(
         student_outputs.logits,
         teacher_outputs.logits,
@@ -343,8 +348,15 @@ def distillation_step(
     )
 
     hard_loss = None
-    if labels is not None and hasattr(student_outputs, "loss") and student_outputs.loss is not None:
-        hard_loss = student_outputs.loss
+    if labels is not None:
+        shift_logits = student_outputs.logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        hard_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
 
     projector_loss = None
     distill_loss = kd_loss
