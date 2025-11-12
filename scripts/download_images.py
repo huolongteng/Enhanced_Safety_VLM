@@ -2,9 +2,9 @@
 
 This script reads the ``train.csv`` and ``test.csv`` files located in the
 ``data`` directory. Each CSV file is expected to contain at least the
-``id`` and ``url`` columns. Images are downloaded from the URLs and stored
-in ``data/train`` and ``data/test`` respectively, using the ``id`` value as
-the filename.
+``id`` and ``url`` columns. Images are downloaded from the URLs, re-encoded
+as JPEG, and stored in ``data/train`` and ``data/test`` respectively, using
+the ``id`` value as the filename.
 
 Example usage::
 
@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import logging
 import os
 import random
@@ -54,6 +55,13 @@ from urllib.parse import urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    from PIL import Image, UnidentifiedImageError
+except ImportError as exc:  # pragma: no cover - optional dependency
+    raise SystemExit(
+        "Pillow is required to run this script. Install it with 'pip install pillow'."
+    ) from exc
 
 try:
     from huggingface_hub import HfFolder
@@ -109,35 +117,10 @@ def _build_request_headers(url: str) -> Dict[str, str]:
     return headers
 
 
-def _normalize_extension(extension: str) -> Optional[str]:
-    """Normalize common image extensions to a canonical lowercase form."""
+def _determine_destination(output_dir: Path, image_id: str, url: str) -> Path:
+    """Return the destination path for a download, always using JPEG output."""
 
-    if not extension:
-        return None
-
-    extension = extension.lower()
-    if extension == ".jpeg":
-        return ".jpg"
-
-    if extension in {".jpg", ".png"}:
-        return extension
-
-    return None
-
-
-def _determine_destination(output_dir: Path, image_id: str, url: str) -> Optional[Path]:
-    """Derive the destination path for a download based on the URL extension."""
-
-    parsed = urlsplit(url)
-    extension = _normalize_extension(Path(parsed.path).suffix)
-
-    if not extension:
-        logging.warning(
-            "Unable to determine image extension for %s (id=%s); skipping.", url, image_id
-        )
-        return None
-
-    return output_dir / f"{image_id}{extension}"
+    return output_dir / f"{image_id}.jpg"
 
 
 def download_image(
@@ -172,11 +155,19 @@ def download_image(
     # Ensure the parent directory exists before writing the file.
     destination.parent.mkdir(parents=True, exist_ok=True)
 
+    image_buffer = io.BytesIO()
+    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+        if chunk:
+            image_buffer.write(chunk)
+
     try:
-        with destination.open("wb") as file:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:  # filter out keep-alive chunks
-                    file.write(chunk)
+        image_buffer.seek(0)
+        with Image.open(image_buffer) as downloaded_image:
+            jpeg_ready = downloaded_image.convert("RGB")
+            jpeg_ready.save(destination, format="JPEG")
+    except UnidentifiedImageError:
+        logging.warning("Downloaded content from %s is not a valid image", url)
+        return False
     except OSError as exc:
         logging.error("Unable to write image to %s: %s", destination, exc)
         return False
@@ -291,17 +282,6 @@ def process_dataset(
                     continue
 
                 destination = _determine_destination(output_dir, image_id, url)
-
-                if destination is None:
-                    skipped += 1
-                    failure_records.append(
-                        {
-                            "csv_file": csv_path.name,
-                            "id": image_id,
-                            "url": url,
-                        }
-                    )
-                    continue
 
                 if destination.exists():
                     logging.info("Image already exists, skipping: %s", destination)
