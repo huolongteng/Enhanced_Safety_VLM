@@ -74,8 +74,8 @@ class TrainingConfig:
     temperature: float = 2.0
     projector_loss_weight: float = 0.0
     gradient_accumulation_steps: int = 32
-    hard_loss_weight: float = 1.0
-    soft_loss_weight: float = 1.0
+    hard_loss_weight: float = HARD_LOSS_WEIGHT
+    soft_loss_weight: float = SOFT_LOSS_WEIGHT
     output_dir: Path = Path("training_outputs")
     seed: int = 2025
     enable_lora: bool = True
@@ -84,6 +84,20 @@ class TrainingConfig:
     early_stopping_min_delta: float = 0.0
     early_stopping_min_epochs: int = 1
     early_stopping_restore_best: bool = True
+
+
+def _validate_training_defaults() -> None:
+    fields = TrainingConfig.__dataclass_fields__
+
+    assert (
+        fields["hard_loss_weight"].default == HARD_LOSS_WEIGHT
+    ), "TrainingConfig.hard_loss_weight default must stay aligned with CLI defaults"
+    assert (
+        fields["soft_loss_weight"].default == SOFT_LOSS_WEIGHT
+    ), "TrainingConfig.soft_loss_weight default must stay aligned with CLI defaults"
+
+
+_validate_training_defaults()
 
 
 def _build_dataloader(

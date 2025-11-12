@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, List, MutableMapping, Sequence
 
 from PIL import Image
@@ -77,11 +77,23 @@ class DatasetEntry:
         if not image_field:
             raise ValueError("Dataset entry is missing the image path")
 
-        image_path_candidate = Path(image_field)
+        windows_like_path = PureWindowsPath(image_field)
+        if "\\" in image_field or windows_like_path.drive:
+            image_field_normalized = windows_like_path.as_posix()
+        else:
+            image_field_normalized = image_field
+
+        image_path_candidate = Path(image_field_normalized)
         if not image_path_candidate.is_absolute():
             image_path = (base_dir / image_path_candidate).resolve()
         else:
             image_path = image_path_candidate
+
+        if not image_path.exists():
+            raise FileNotFoundError(
+                f"Image file not found for dataset entry '{identifier}': {image_path}"
+            )
+
         output_raw = mapping.get("output")
         output_text = output_raw if isinstance(output_raw, str) else str(output_raw or "")
 
