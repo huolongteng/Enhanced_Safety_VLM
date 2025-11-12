@@ -135,6 +135,7 @@ class SafetyPolicyDataset(Dataset):
         image = Image.open(entry.image_path).convert("RGB")
         image = self.transform(image)
 
+        assistant_text = entry.output.strip()
         conversation = [
             {
                 "role": "user",
@@ -143,17 +144,22 @@ class SafetyPolicyDataset(Dataset):
                     {"type": "text", "text": entry.policy},
                 ],
             },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": entry.output},
-                ],
-            },
         ]
+
+        if assistant_text:
+            conversation.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": assistant_text},
+                    ],
+                }
+            )
 
         return {
             "image": image,
             "conversation": conversation,
+            "assistant_text": assistant_text,
         }
 
 
@@ -180,8 +186,10 @@ def build_policy_collate_fn(
     processor,
     *,
     add_generation_prompt: bool = False,
+    include_labels: bool = False,
     padding: bool | str = False,
     return_tensors: str = "pt",
+    return_conversations: bool = False,
     **processor_kwargs: Any,
 ):
     """Build a collate function that uses ``processor`` for batching."""
@@ -192,19 +200,85 @@ def build_policy_collate_fn(
 
         images = [sample["image"] for sample in batch]
         conversations = [sample["conversation"] for sample in batch]
-        prompts = apply_chat_template_to_batch(
-            conversations,
-            processor,
-            add_generation_prompt=add_generation_prompt,
-        )
 
-        return processor(
-            text=prompts,
-            images=images,
-            padding=padding,
-            return_tensors=return_tensors,
-            **processor_kwargs,
-        )
+        processor_kwargs.setdefault("truncation", True)
+
+        if include_labels:
+            # Prepare two flavours of the conversation text: one including the
+            # assistant response and another limited to the user turn.  The
+            # former is used to build ``input_ids`` while the latter provides
+            # the prompt length so that the corresponding label tokens can be
+            # masked out.
+            full_texts = apply_chat_template_to_batch(
+                conversations,
+                processor,
+                add_generation_prompt=False,
+            )
+
+            user_only_conversations: List[Sequence[MutableMapping[str, Any]]] = []
+            for conversation in conversations:
+                if conversation and conversation[-1].get("role") == "assistant":
+                    user_only_conversations.append(conversation[:-1])
+                else:
+                    user_only_conversations.append(conversation)
+
+            prompt_texts = apply_chat_template_to_batch(
+                user_only_conversations,
+                processor,
+                add_generation_prompt=True,
+            )
+
+            model_inputs = processor(
+                text=full_texts,
+                images=images,
+                padding=padding,
+                return_tensors=return_tensors,
+                **processor_kwargs,
+            )
+
+            prompt_tokens = processor.tokenizer(
+                prompt_texts,
+                padding=padding,
+                return_tensors=return_tensors,
+                truncation=True,
+            )
+
+            labels = model_inputs["input_ids"].clone()
+            attention_mask = prompt_tokens.get("attention_mask")
+            pad_id = getattr(processor.tokenizer, "pad_token_id", None)
+
+            for idx in range(labels.size(0)):
+                if attention_mask is not None:
+                    prompt_length = int(attention_mask[idx].sum().item())
+                else:
+                    row = prompt_tokens["input_ids"][idx]
+                    if pad_id is not None:
+                        prompt_length = int((row != pad_id).sum().item())
+                    else:
+                        prompt_length = len(row)
+
+                labels[idx, :prompt_length] = -100
+
+            model_inputs["labels"] = labels
+        else:
+            prompt_texts = apply_chat_template_to_batch(
+                conversations,
+                processor,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+            model_inputs = processor(
+                text=prompt_texts,
+                images=images,
+                padding=padding,
+                return_tensors=return_tensors,
+                **processor_kwargs,
+            )
+
+        if return_conversations:
+            model_inputs["conversations"] = conversations
+
+        return model_inputs
 
     return collate_fn
 
@@ -216,6 +290,7 @@ def create_policy_dataloader(
     batch_size: int,
     image_size: int,
     shuffle: bool = True,
+    include_labels: bool = True,
 ) -> DataLoader:
     """Create a dataloader from dataset entries and a processor."""
 
@@ -223,6 +298,7 @@ def create_policy_dataloader(
     collate_fn = build_policy_collate_fn(
         processor,
         add_generation_prompt=True,
+        include_labels=include_labels,
         padding=True,
         return_tensors="pt",
     )
@@ -241,6 +317,7 @@ def load_default_dataloaders(
     batch_size: int,
     image_size: int,
     shuffle_train: bool = True,
+    include_labels: bool = True,
 ) -> Dict[str, DataLoader]:
     """Load train and evaluation dataloaders using default JSON paths."""
 
@@ -253,6 +330,7 @@ def load_default_dataloaders(
         batch_size=batch_size,
         image_size=image_size,
         shuffle=shuffle_train,
+        include_labels=include_labels,
     )
     eval_loader = create_policy_dataloader(
         eval_entries,
@@ -260,6 +338,7 @@ def load_default_dataloaders(
         batch_size=batch_size,
         image_size=image_size,
         shuffle=False,
+        include_labels=include_labels,
     )
 
     return {"train": train_loader, "eval": eval_loader}
