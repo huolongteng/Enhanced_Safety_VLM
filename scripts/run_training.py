@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
-from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 from transformers.utils import logging as hf_logging
 
 from dataset_generate import (
@@ -16,6 +15,7 @@ from dataset_generate import (
     create_policy_dataloader,
     load_dataset_entries,
 )
+from load_models import load_model_and_processor
 from train_utils import (
     DistillationStats,
     EarlyStoppingConfig,
@@ -57,19 +57,6 @@ class TrainingConfig:
     early_stopping_min_delta: float = 0.0
     early_stopping_min_epochs: int = 1
     early_stopping_restore_best: bool = True
-
-
-def load_model_and_processor(teacher_path: str, student_path: str):
-    """Load teacher/student models alongside the shared processor."""
-
-    teacher_model = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
-    student_model = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
-    processor = AutoProcessor.from_pretrained(teacher_path)
-
-    teacher_model.config.sliding_window = False
-    student_model.config.sliding_window = False
-
-    return teacher_model, student_model, processor
 
 
 def _build_dataloader(
