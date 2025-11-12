@@ -47,8 +47,8 @@ LEARNING_RATE = 5e-5
 TEMPERATURE = 2.0
 PROJECTOR_LOSS_WEIGHT = 0.0
 GRADIENT_ACCUMULATION_STEPS = 32
-HARD_LOSS_WEIGHT = 1.0
-SOFT_LOSS_WEIGHT = 1.0
+HARD_LOSS_WEIGHT = 0.5
+SOFT_LOSS_WEIGHT = 0.5
 OUTPUT_DIR = Path("training_outputs")
 SEED = 2025
 ENABLE_LORA = True
@@ -147,6 +147,13 @@ def main(config: TrainingConfig | None = None) -> DistillationStats:
         image_size=cfg.image_size,
         shuffle=True,
     )
+    if hasattr(train_loader, "dataset"):
+        try:
+            train_size = len(train_loader.dataset)
+        except TypeError:
+            train_size = "unknown"
+        else:
+            print(f"Loaded {train_size} training samples from {train_json}")
 
     if eval_json is not None and Path(eval_json).exists():
         try:

@@ -484,13 +484,10 @@ def run_kd_training(
 
             accumulated_batches += 1
 
-            if current_cycle_size <= 0:
-                current_cycle_size = gradient_accumulation_steps
-
             zero_grad = accumulated_batches == 1
-            step_optimizer = accumulated_batches == current_cycle_size
+            should_step = accumulated_batches >= max(1, current_cycle_size)
 
-            loss_scale = 1.0 / float(current_cycle_size)
+            loss_scale = 1.0 / float(max(1, current_cycle_size))
 
             step_loss = distillation_step(
                 teacher_model,
@@ -503,34 +500,71 @@ def run_kd_training(
                 loss_weights=weights,
                 loss_scale=loss_scale,
                 zero_grad=zero_grad,
-                step_optimizer=step_optimizer,
-                zero_after_step=True,
+                step_optimizer=should_step,
+                zero_after_step=should_step,
             )
-
-            accumulation_loss += step_loss
-            if step_optimizer:
-                if scheduler is not None:
-                    scheduler.step()
-
-                accumulated_batches = 0
-                step_losses.append(accumulation_loss)
-                accumulation_loss = 0.0
-                global_step += 1
 
             running_loss += step_loss
             num_batches += 1
+            accumulation_loss += step_loss
 
             progress_bar.update(1)
 
-        if num_batches > 0:
-            epoch_loss = running_loss / num_batches
-        else:
-            epoch_loss = float("inf")
+            if should_step:
+                cycle_batch_count = accumulated_batches
+                average_cycle_loss = accumulation_loss / max(1, cycle_batch_count)
+                step_losses.append(average_cycle_loss)
+                global_step += 1
+                accumulation_loss = 0.0
+                accumulated_batches = 0
 
+                if scheduler is not None:
+                    scheduler.step()
+
+        if accumulated_batches > 0:
+            correction = (
+                current_cycle_size / max(1, accumulated_batches)
+                if current_cycle_size != accumulated_batches
+                else 1.0
+            )
+            if correction != 1.0:
+                for group in optimizer.param_groups:
+                    for param in group["params"]:
+                        if param.grad is not None:
+                            param.grad.mul_(correction)
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            cycle_batch_count = accumulated_batches
+            average_cycle_loss = accumulation_loss / max(1, cycle_batch_count)
+            step_losses.append(average_cycle_loss)
+            global_step += 1
+            accumulated_batches = 0
+            accumulation_loss = 0.0
+
+            if scheduler is not None:
+                scheduler.step()
+
+        epoch_loss = running_loss / max(1, num_batches)
         epoch_losses.append(epoch_loss)
 
+        current_lr = optimizer.param_groups[0]["lr"]
+        metrics = [
+            f"Epoch {epoch + 1}/{num_epochs}",
+            f"average_loss={epoch_loss:.4f}",
+            f"lr={current_lr:.6g}",
+            f"temperature={temperature:.2f}",
+        ]
+        if batch_size is not None:
+            metrics.append(f"batch_size={batch_size}")
+        metrics.append(f"steps={global_step}")
+        progress_bar.write(" | ".join(metrics))
+        if total_batches is None:
+            progress_bar.refresh()
+
         if early_cfg is not None:
-            improved = epoch_loss < (best_loss - early_cfg.min_delta)
+            improved = epoch_loss + early_cfg.min_delta < best_loss
             if improved:
                 best_loss = epoch_loss
                 best_epoch = epoch
