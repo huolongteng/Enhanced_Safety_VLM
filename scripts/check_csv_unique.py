@@ -4,16 +4,16 @@ This script inspects the `train.csv` and `test.csv` files under the
 project's `data` directory and verifies that the values in their `id`
 columns are unique.  It prints a short report for each file indicating
 whether duplicates were found and, when duplicates exist, whether the
-remaining columns also match.
+remaining columns also match.  Rows that are identical across every
+column are treated as a single entry during the check.
 """
 from __future__ import annotations
 
+import csv
 import sys
 from collections import Counter
 from pathlib import Path
 from typing import List, Sequence
-
-import csv
 
 
 def read_rows(csv_path: Path, required_column: str) -> tuple[List[dict[str, str]], Sequence[str]]:
@@ -32,6 +32,26 @@ def read_rows(csv_path: Path, required_column: str) -> tuple[List[dict[str, str]
         return rows, reader.fieldnames
 
 
+def collapse_identical_rows(
+    rows: List[dict[str, str]], fieldnames: Sequence[str]
+) -> tuple[List[dict[str, str]], int]:
+    """Return ``rows`` without exact duplicates along with removal count."""
+
+    seen_rows: set[tuple[str, ...]] = set()
+    unique_rows: List[dict[str, str]] = []
+    duplicates_removed = 0
+
+    for row in rows:
+        key = tuple(row[field] for field in fieldnames)
+        if key in seen_rows:
+            duplicates_removed += 1
+            continue
+        seen_rows.add(key)
+        unique_rows.append(row)
+
+    return unique_rows, duplicates_removed
+
+
 def check_uniqueness(csv_path: Path, column_name: str = "id") -> bool:
     """Check that ``column_name`` values in ``csv_path`` are unique.
 
@@ -39,6 +59,14 @@ def check_uniqueness(csv_path: Path, column_name: str = "id") -> bool:
     """
 
     rows, fieldnames = read_rows(csv_path, column_name)
+
+    rows, removed_duplicates = collapse_identical_rows(rows, fieldnames)
+    if removed_duplicates:
+        print(
+            f"{csv_path.name}: Removed {removed_duplicates} completely identical "
+            "duplicate row(s)."
+        )
+
     values = [row[column_name] for row in rows]
     counter = Counter(values)
     duplicates = {value: count for value, count in counter.items() if count > 1}
