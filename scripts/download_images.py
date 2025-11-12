@@ -109,6 +109,37 @@ def _build_request_headers(url: str) -> Dict[str, str]:
     return headers
 
 
+def _normalize_extension(extension: str) -> Optional[str]:
+    """Normalize common image extensions to a canonical lowercase form."""
+
+    if not extension:
+        return None
+
+    extension = extension.lower()
+    if extension == ".jpeg":
+        return ".jpg"
+
+    if extension in {".jpg", ".png"}:
+        return extension
+
+    return None
+
+
+def _determine_destination(output_dir: Path, image_id: str, url: str) -> Optional[Path]:
+    """Derive the destination path for a download based on the URL extension."""
+
+    parsed = urlsplit(url)
+    extension = _normalize_extension(Path(parsed.path).suffix)
+
+    if not extension:
+        logging.warning(
+            "Unable to determine image extension for %s (id=%s); skipping.", url, image_id
+        )
+        return None
+
+    return output_dir / f"{image_id}{extension}"
+
+
 def download_image(
     session: requests.Session,
     url: str,
@@ -259,7 +290,18 @@ def process_dataset(
                     )
                     continue
 
-                destination = output_dir / image_id
+                destination = _determine_destination(output_dir, image_id, url)
+
+                if destination is None:
+                    skipped += 1
+                    failure_records.append(
+                        {
+                            "csv_file": csv_path.name,
+                            "id": image_id,
+                            "url": url,
+                        }
+                    )
+                    continue
 
                 if destination.exists():
                     logging.info("Image already exists, skipping: %s", destination)
