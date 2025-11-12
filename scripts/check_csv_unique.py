@@ -3,42 +3,33 @@
 This script inspects the `train.csv` and `test.csv` files under the
 project's `data` directory and verifies that the values in their `id`
 columns are unique.  It prints a short report for each file indicating
-whether duplicates were found.
+whether duplicates were found and, when duplicates exist, whether the
+remaining columns also match.
 """
 from __future__ import annotations
 
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Iterable
+from typing import List, Sequence
 
 import csv
 
 
-def read_column_values(csv_path: Path, column_name: str) -> Iterable[str]:
-    """Yield values from ``column_name`` in ``csv_path``.
+def read_rows(csv_path: Path, required_column: str) -> tuple[List[dict[str, str]], Sequence[str]]:
+    """Read ``csv_path`` and return its rows and field names.
 
-    Parameters
-    ----------
-    csv_path:
-        Path to the CSV file to read.
-    column_name:
-        Name of the column whose values should be yielded.
-
-    Raises
-    ------
-    ValueError
-        If the requested column is missing from the CSV file.
+    The ``required_column`` must be present in the CSV.
     """
 
     with csv_path.open(newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
-        if reader.fieldnames is None or column_name not in reader.fieldnames:
+        if reader.fieldnames is None or required_column not in reader.fieldnames:
             raise ValueError(
-                f"Column '{column_name}' not found in {csv_path.name}."
+                f"Column '{required_column}' not found in {csv_path.name}."
             )
-        for row in reader:
-            yield row[column_name]
+        rows = list(reader)
+        return rows, reader.fieldnames
 
 
 def check_uniqueness(csv_path: Path, column_name: str = "id") -> bool:
@@ -47,14 +38,35 @@ def check_uniqueness(csv_path: Path, column_name: str = "id") -> bool:
     Returns ``True`` when all values are unique, otherwise ``False``.
     """
 
-    values = list(read_column_values(csv_path, column_name))
+    rows, fieldnames = read_rows(csv_path, column_name)
+    values = [row[column_name] for row in rows]
     counter = Counter(values)
     duplicates = {value: count for value, count in counter.items() if count > 1}
 
     if duplicates:
+        remaining_fields = [field for field in fieldnames if field != column_name]
         print(f"{csv_path.name}: Found duplicates in '{column_name}' column.")
         for value, count in duplicates.items():
             print(f"  Value '{value}' appears {count} times")
+
+            duplicate_rows = [
+                tuple(row[field] for field in remaining_fields)
+                for row in rows
+                if row[column_name] == value
+            ]
+            unique_remaining = set(duplicate_rows)
+            if not remaining_fields:
+                print("    No additional columns to compare.")
+            elif len(unique_remaining) == 1:
+                print("    Remaining columns are identical across duplicates.")
+            else:
+                print("    Remaining columns differ across duplicates:")
+                for idx, values_tuple in enumerate(duplicate_rows, start=1):
+                    formatted_values = ", ".join(
+                        f"{field}='{field_value}'"
+                        for field, field_value in zip(remaining_fields, values_tuple)
+                    )
+                    print(f"      Duplicate #{idx}: {formatted_values}")
         return False
 
     print(f"{csv_path.name}: All values in '{column_name}' column are unique.")
