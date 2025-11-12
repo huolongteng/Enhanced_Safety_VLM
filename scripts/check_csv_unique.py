@@ -51,11 +51,19 @@ def collapse_identical_rows(
 
     return unique_rows, duplicates_removed
 
+def write_rows(csv_path: Path, rows: List[dict[str, str]], fieldnames: Sequence[str]) -> None:
+    """Write `rows` back to `csv_path` using the provided `fieldnames`."""
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(fieldnames))
+        writer.writeheader()
+        writer.writerows(rows)
+
 
 def check_uniqueness(csv_path: Path, column_name: str = "id") -> bool:
     """Check that ``column_name`` values in ``csv_path`` are unique.
 
-    Returns ``True`` when all values are unique, otherwise ``False``.
+    If completely identical duplicate rows are found they are removed and
+    the cleaned CSV is written back to `csv_path`.
     """
 
     rows, fieldnames = read_rows(csv_path, column_name)
@@ -66,6 +74,8 @@ def check_uniqueness(csv_path: Path, column_name: str = "id") -> bool:
             f"{csv_path.name}: Removed {removed_duplicates} completely identical "
             "duplicate row(s)."
         )
+        write_rows(csv_path, rows, fieldnames)
+        print(f"Wrote cleaned CSV to `{csv_path}` ({len(rows)} rows).")
 
     values = [row[column_name] for row in rows]
     counter = Counter(values)
