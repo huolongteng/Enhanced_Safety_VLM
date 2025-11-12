@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Sequence
 
 from PIL import Image
+import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -247,7 +248,13 @@ def build_policy_collate_fn(
             attention_mask = prompt_tokens.get("attention_mask")
             pad_id = getattr(processor.tokenizer, "pad_token_id", None)
 
-            for idx in range(labels.size(0)):
+            if pad_id is not None:
+                labels[labels == pad_id] = -100
+
+            original_batch = labels.size(0)
+            valid_indices: List[int] = []
+
+            for idx in range(original_batch):
                 if attention_mask is not None:
                     prompt_length = int(attention_mask[idx].sum().item())
                 else:
@@ -258,6 +265,30 @@ def build_policy_collate_fn(
                         prompt_length = len(row)
 
                 labels[idx, :prompt_length] = -100
+
+                if (labels[idx] != -100).any():
+                    valid_indices.append(idx)
+
+            if len(valid_indices) != original_batch:
+                if not valid_indices:
+                    raise ValueError(
+                        "All samples in the batch were filtered out because they "
+                        "did not contain assistant target tokens."
+                    )
+
+                index_tensor = torch.tensor(valid_indices, device=labels.device, dtype=torch.long)
+                labels = labels.index_select(0, index_tensor)
+
+                for key, value in list(model_inputs.items()):
+                    if key == "labels":
+                        continue
+
+                    if isinstance(value, torch.Tensor) and value.size(0) == original_batch:
+                        model_inputs[key] = value.index_select(0, index_tensor.to(value.device))
+                    elif isinstance(value, list) and len(value) == original_batch:
+                        model_inputs[key] = [value[i] for i in valid_indices]
+
+                conversations[:] = [conversations[i] for i in valid_indices]
 
             model_inputs["labels"] = labels
         else:

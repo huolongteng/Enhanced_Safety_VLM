@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers.optimization import get_cosine_schedule_with_warmup
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -203,8 +207,20 @@ def compute_kd_loss(
     teacher_probs = teacher_probs[:, :-1, :].contiguous()
 
     mask = None
+    label_mask = None
     if labels is not None:
-        mask = labels[..., 1:] != -100
+        label_mask = labels[..., 1:] != -100
+        if label_mask.any():
+            mask = label_mask
+        elif attention_mask is not None:
+            mask = attention_mask[..., 1:].bool()
+            logger.warning(
+                "Knowledge distillation label mask was empty; falling back to the attention mask."
+            )
+        else:
+            logger.warning(
+                "Knowledge distillation label mask was empty and no attention mask was provided."
+            )
     elif attention_mask is not None:
         mask = attention_mask[..., 1:].bool()
 
@@ -217,6 +233,9 @@ def compute_kd_loss(
             student_flat = student_flat[mask_flat]
             teacher_flat = teacher_flat[mask_flat]
         else:
+            logger.warning(
+                "Knowledge distillation mask produced no valid tokens; returning zero KD loss."
+            )
             return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
 
     kd = F.kl_div(student_flat, teacher_flat, reduction="batchmean")
