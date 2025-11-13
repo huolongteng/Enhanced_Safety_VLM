@@ -1,4 +1,6 @@
 import json
+from typing import List, Sequence, Tuple
+
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -20,17 +22,21 @@ class PolicyImageDataset(Dataset):
         self.image_paths = image_paths
         self.policy_lists = policy_lists
         self.response_lists = response_lists
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-        ])
+
+        transform_steps = []
+        if image_size is not None:
+            transform_steps.append(transforms.Resize((image_size, image_size)))
+        self.transform = transforms.Compose(transform_steps) if transform_steps else None
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
-        image = Image.open(image_path).convert("RGB")
-        image = self.transform(image)
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
         policy = self.policy_lists[idx]
         response = self.response_lists[idx]
         return {
@@ -67,21 +73,87 @@ def read_images_policies_responses_paths(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    image_paths = []
-    policy_texts = []
-    response_texts = []
+    image_paths: List[str] = []
+    policy_texts: List[str] = []
+    response_texts: List[str] = []
+
     for obj in data:
-        image_path = (obj.get("input") or {}).get("image")
-        policy_text = (obj.get("input") or {}).get("policy")
-        if isinstance(image_path, str) and image_path.strip():
-            image_paths.append(image_path)
-        if isinstance(policy_text, str) and policy_text.strip():
-            policy_texts.append(policy_text)
-        response_text = (obj.get("output") or {})
+        input_payload = obj.get("input") or {}
+        output_payload = obj.get("output")
+
+        image_path = input_payload.get("image") if isinstance(input_payload, dict) else None
+        policy_text = input_payload.get("policy") if isinstance(input_payload, dict) else None
+
+        if isinstance(output_payload, dict):
+            response_text = output_payload.get("response")
+        else:
+            response_text = output_payload
+
+        if not (isinstance(image_path, str) and image_path.strip()):
+            continue
+        if not (isinstance(policy_text, str) and policy_text.strip()):
+            continue
         if isinstance(response_text, str) and response_text.strip():
-            response_texts.append(response_text)
+            final_response = response_text
+        elif response_text is not None:
+            final_response = json.dumps(response_text, ensure_ascii=False)
+        else:
+            continue
+
+        image_paths.append(image_path)
+        policy_texts.append(policy_text)
+        response_texts.append(final_response)
+
+    if not (len(image_paths) == len(policy_texts) == len(response_texts)):
+        raise ValueError("Dataset fields have mismatched lengths after filtering invalid entries.")
+    if not image_paths:
+        raise ValueError("No valid samples were found in the dataset file.")
 
     return image_paths, policy_texts, response_texts
+
+
+def _count_image_slots(conversation: Sequence[dict]) -> int:
+    count = 0
+    for message in conversation:
+        if not isinstance(message, dict):
+            continue
+        contents = message.get("content") or []
+        for item in contents:
+            if isinstance(item, dict) and item.get("type") == "image":
+                count += 1
+    return count
+
+
+def _ensure_image_sequence(image) -> List:
+    if isinstance(image, (list, tuple)):
+        return list(image)
+    return [image] if image is not None else []
+
+
+def _infer_image_size(image) -> Tuple[int, int]:
+    if hasattr(image, "height") and hasattr(image, "width"):
+        return int(image.height), int(image.width)
+
+    size = getattr(image, "size", None)
+    if isinstance(size, tuple) and len(size) == 2:
+        # PIL images expose (width, height)
+        width, height = size
+        return int(height), int(width)
+
+    shape = getattr(image, "shape", None)
+    if isinstance(shape, Sequence):
+        if len(shape) == 2:
+            height, width = shape
+            return int(height), int(width)
+        if len(shape) == 3:
+            # Handle both (H, W, C) and (C, H, W)
+            if shape[0] in (1, 3, 4):
+                height, width = shape[1], shape[2]
+            else:
+                height, width = shape[0], shape[1]
+            return int(height), int(width)
+
+    raise ValueError("Unable to infer image size for processor consumption.")
 
 def apply_chat_template_to_batch(conversations, processor, add_generation_prompt=False):
     """Apply the chat template to a batch of conversations."""
@@ -108,21 +180,62 @@ def build_policy_collate_fn(
         if not batch:
             raise ValueError("Received an empty batch.")
 
-        images = [sample["image"] for sample in batch]
         conversations = [sample["conversation"] for sample in batch]
+
+        flat_images: List = []
+        image_sizes: List[Tuple[int, int]] = []
+
+        for sample, conversation in zip(batch, conversations):
+            required_slots = _count_image_slots(conversation)
+            sample_images = _ensure_image_sequence(sample.get("image"))
+
+            if required_slots == 0:
+                if sample_images:
+                    raise ValueError(
+                        "Sample contains image data but the conversation does not request images."
+                    )
+                continue
+
+            if not sample_images:
+                raise ValueError(
+                    "Conversation expects images, but none were provided for the sample."
+                )
+
+            if len(sample_images) == 1 and required_slots > 1:
+                sample_images = sample_images * required_slots
+            elif len(sample_images) != required_slots:
+                raise ValueError(
+                    "Number of provided images does not match the required image slots in the conversation."
+                )
+
+            for image in sample_images:
+                flat_images.append(image)
+                image_sizes.append(_infer_image_size(image))
         prompts = apply_chat_template_to_batch(
             conversations,
             processor,
             add_generation_prompt=add_generation_prompt,
         )
 
-        return processor(
-            text=prompts,
-            images=images,
-            padding=padding,
-            return_tensors=return_tensors,
-            **processor_kwargs,
+        processor_inputs = dict(processor_kwargs)
+        provided_image_sizes = processor_inputs.pop("image_sizes", None)
+        processor_inputs.pop("images", None)
+
+        processor_inputs.update(
+            {
+                "text": prompts,
+                "padding": padding,
+                "return_tensors": return_tensors,
+            }
         )
+
+        if flat_images:
+            processor_inputs["images"] = flat_images
+            processor_inputs["image_sizes"] = provided_image_sizes or image_sizes
+        elif provided_image_sizes is not None:
+            processor_inputs["image_sizes"] = provided_image_sizes
+
+        return processor(**processor_inputs)
 
     return collate_fn
 
