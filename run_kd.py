@@ -1,24 +1,24 @@
-"""Entry point for the knowledge-distillation training script."""
+"""Entry point for the supervised fine-tuning training script."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from PIL import Image, UnidentifiedImageError
 import torch
 from transformers.utils import logging as hf_logging
 
-from dataset import create_policy_dataloader, gather_image_paths, load_policy_text
-from load_models import load_model_and_processor
+from dataset import create_policy_dataloader, load_split_entries
+from load_models import load_student_model_and_processor
 from train import (
-    DistillationStats,
     EarlyStoppingConfig,
     LoraAdapterSettings,
     apply_lora_adapters,
-    run_kd_training,
+    run_supervised_training,
     save_training_artifacts,
     seed_everything,
+    TrainingStats,
 )
 
 from transformers.utils import logging
@@ -28,17 +28,12 @@ logging.set_verbosity_error()
 # Configuration
 # ---------------------------------------------------------------------------
 
-IMAGE_FOLDER = "tmp"
-MAX_IMAGES = 4657
-TEACHER_MODEL_PATH = "E:/models/LlavaGuard-v1.2-0.5B-OV-hf"
+TRAIN_DATASET_PATH = Path("data/train_dataset.json")
+IMAGE_ROOT = Path("/data")
 STUDENT_MODEL_PATH = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"
-POLICY_PATH = Path("policy.json")
-POLICY_INDEX = 0
 NUM_EPOCHS = 3
 BATCH_SIZE = 1
 LEARNING_RATE = 7e-4
-DISTILL_TEMPERATURE = 2.0
-PROJECTOR_LOSS_WEIGHT = 0
 STEP_PLOT_STRIDE = 10
 IMAGE_SIZE = 256
 OUTPUT_DIR = Path(".")
@@ -54,19 +49,14 @@ EARLY_STOPPING_RESTORE_BEST = True
 
 @dataclass(frozen=True)
 class KDConfig:
-    """Collect configuration values for the KD run."""
+    """Collect configuration values for the supervised fine-tuning run."""
 
-    image_folder: str = IMAGE_FOLDER
-    max_images: int = MAX_IMAGES
-    teacher_model_path: str = TEACHER_MODEL_PATH
+    train_dataset_path: Path = TRAIN_DATASET_PATH
+    image_root: Path = IMAGE_ROOT
     student_model_path: str = STUDENT_MODEL_PATH
-    policy_path: Path = POLICY_PATH
-    policy_index: int = POLICY_INDEX
     num_epochs: int = NUM_EPOCHS
     batch_size: int = BATCH_SIZE
     learning_rate: float = LEARNING_RATE
-    distill_temperature: float = DISTILL_TEMPERATURE
-    projector_loss_weight: float = PROJECTOR_LOSS_WEIGHT
     step_plot_stride: int = STEP_PLOT_STRIDE
     image_size: int = IMAGE_SIZE
     output_dir: Path = OUTPUT_DIR
@@ -85,11 +75,11 @@ class KDConfig:
 # ---------------------------------------------------------------------------
 
 
-def _filter_valid_images(paths: Iterable[str]) -> list[str]:
+def _filter_valid_images(paths: Iterable[Path]) -> list[Path]:
     """Remove image paths that cannot be opened by PIL."""
 
-    valid_paths: list[str] = []
-    skipped_paths: list[str] = []
+    valid_paths: list[Path] = []
+    skipped_paths: list[Path] = []
 
     for path in paths:
         try:
@@ -115,7 +105,25 @@ def _filter_valid_images(paths: Iterable[str]) -> list[str]:
     return valid_paths
 
 
-def main(config: KDConfig | None = None) -> DistillationStats:
+def _collect_sample_paths(
+    samples: Sequence[dict],
+    image_root: Path,
+) -> list[Path]:
+    """Resolve sample image paths relative to ``image_root``."""
+
+    resolved: list[Path] = []
+    for sample in samples:
+        image_rel = sample.get("image")
+        if not image_rel:
+            continue
+        path = Path(image_rel)
+        if not path.is_absolute():
+            path = image_root / path
+        resolved.append(path)
+    return resolved
+
+
+def main(config: KDConfig | None = None) -> TrainingStats:
     cfg = config or KDConfig()
 
     seed_everything(cfg.seed)
@@ -124,34 +132,19 @@ def main(config: KDConfig | None = None) -> DistillationStats:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    policy_text = load_policy_text(cfg.policy_path, cfg.policy_index)
+    samples = load_split_entries(cfg.train_dataset_path, cfg.image_root)
+    if not samples:
+        raise ValueError("No training samples were loaded from the dataset split.")
 
-    image_paths = gather_image_paths(cfg.image_folder)
-    image_paths = _filter_valid_images(image_paths)
+    sample_paths = _collect_sample_paths(samples, cfg.image_root)
+    if sample_paths:
+        _filter_valid_images(sample_paths[:50])
 
-    if not image_paths:
-        raise ValueError("No valid images are available for training.")
-
-    if cfg.max_images != len(image_paths):
-        print(
-            "Adjusting max_images from {old} to match available images: {new}".format(
-                old=cfg.max_images,
-                new=len(image_paths),
-            )
-        )
-        cfg = replace(cfg, max_images=len(image_paths))
-
-    image_paths = image_paths[: cfg.max_images]
-    print(f"Loaded {len(image_paths)} validated image paths for training.")
-
-    teacher_model, student_model, processor = load_model_and_processor(
-        cfg.teacher_model_path,
-        cfg.student_model_path,
-    )
+    student_model, processor = load_student_model_and_processor(cfg.student_model_path)
 
     dataloader = create_policy_dataloader(
-        image_paths,
-        policy_text,
+        samples,
+        cfg.image_root,
         processor,
         batch_size=cfg.batch_size,
         image_size=cfg.image_size,
@@ -168,15 +161,12 @@ def main(config: KDConfig | None = None) -> DistillationStats:
         restore_best_weights=cfg.early_stopping_restore_best,
     )
 
-    stats = run_kd_training(
-        teacher_model,
+    stats = run_supervised_training(
         student_model,
         dataloader,
         device=device,
         learning_rate=cfg.learning_rate,
-        temperature=cfg.distill_temperature,
         num_epochs=cfg.num_epochs,
-        projector_loss_weight=cfg.projector_loss_weight,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         early_stopping=early_stopping_cfg,
     )

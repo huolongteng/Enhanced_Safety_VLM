@@ -53,11 +53,14 @@ def load_split_entries(dataset_json: Path | str, image_root: Path | str) -> List
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset JSON not found: {dataset_path}")
 
+    base_root = Path(image_root)
+    if not base_root.exists():
+        print(f"Warning: image root `{base_root}` does not exist on disk.")
+
     with dataset_path.open("r", encoding="utf-8") as fp:
         raw_entries = json.load(fp)
 
     normalized_entries: List[Dict[str, Any]] = []
-    base_root = Path(image_root)
     for record in raw_entries:
         input_payload = record.get("input", {}) or {}
         output_payload = record.get("output", {})
@@ -84,7 +87,6 @@ def load_split_entries(dataset_json: Path | str, image_root: Path | str) -> List
                 "policy": policy_text,
                 "output": output_payload,
                 "label_text": label_text,
-                "image_root": base_root,
             }
         )
 
@@ -267,7 +269,7 @@ def build_policy_collate_fn(
 
 
 def create_policy_dataloader(
-    dataset_json: Path | str,
+    data: Sequence[Dict[str, Any]] | Path | str,
     image_root: Path | str,
     processor,
     *,
@@ -277,7 +279,14 @@ def create_policy_dataloader(
 ) -> DataLoader:
     """Build a dataloader for policy-conditioned image datasets with labels."""
 
-    samples = load_split_entries(dataset_json, image_root)
+    if isinstance(data, (str, Path)):
+        samples = load_split_entries(data, image_root)
+    else:
+        samples = list(data)
+
+    if not samples:
+        raise ValueError("No samples available to build the dataloader.")
+
     dataset = PolicyImageDataset(samples, image_root=image_root, image_size=image_size)
 
     collate_fn = build_policy_collate_fn(
