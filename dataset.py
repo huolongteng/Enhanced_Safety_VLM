@@ -1,128 +1,163 @@
-# This block is about dataset handling and preprocessing for a machine learning project.
+"""Dataset utilities for policy-aware, labelled training data."""
+
+from __future__ import annotations
+
 import json
-import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Iterable, List, Sequence
 
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-def count_jpg_in_folder(folder_name):
+
+@dataclass(frozen=True)
+class PolicySample:
+    """Container describing a single multimodal policy example."""
+
+    image_path: Path
+    policy_text: str
+    label_text: str
+
+
+def _normalise_relative_path(path_value: str) -> Path:
+    """Return a POSIX-style relative path for ``path_value``."""
+
+    normalised = path_value.replace("\\", "/")
+    return Path(normalised)
+
+
+def _format_label_text(output_field) -> str:
+    """Format the label portion of a dataset entry into natural text."""
+
+    if isinstance(output_field, str):
+        try:
+            payload = json.loads(output_field)
+        except json.JSONDecodeError:
+            payload = {"response": output_field}
+    elif isinstance(output_field, dict):
+        payload = output_field
+    else:
+        payload = {}
+
+    rating = payload.get("rating")
+    category = payload.get("category")
+    rationale = payload.get("rationale")
+
+    parts: List[str] = []
+    if rating:
+        parts.append(f"Rating: {rating}")
+    if category:
+        parts.append(f"Category: {category}")
+    if rationale:
+        parts.append(f"Rationale: {rationale}")
+
+    if not parts and output_field is not None:
+        parts.append(str(output_field))
+
+    return "\n".join(parts).strip()
+
+
+def load_split_entries(dataset_json: Path | str, image_root: Path | str) -> List[PolicySample]:
+    """Load and normalise entries from ``dataset_json``.
+
+    Parameters
+    ----------
+    dataset_json:
+        Path to the JSON file containing the dataset split.
+    image_root:
+        Base directory containing the ``train``/``test`` image folders.  The
+        argument is accepted for convenience and validation even though the
+        returned samples only store relative paths.
     """
-    Counts the number of .jpg files in the specified folder.
 
-    Args:
-        folder_name (str): The path to the folder.
-    """
-    base_dir = Path(__file__).parent
-    tmp_dir = base_dir / folder_name
-    if not tmp_dir.exists() or not tmp_dir.is_dir():
-        print(f"`{tmp_dir} not exists or is not a directory.`")
-        return 0
-    count = sum(1 for p in tmp_dir.iterdir() if p.is_file() and p.suffix.lower() == ".jpg")
-    print(f"Found {count} .jpg files in `{tmp_dir}`.")
-    return count
+    dataset_path = Path(dataset_json)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
-def get_dirs_with_jpg(base_folder_name):
-    """
-        Returns a list of the absolute paths of all '.jpg' or '.jpeg' image files
-        (recursively) under `base_folder_name`.
-        """
-    base_dir = Path(__file__).parent if "__file__" in globals() else Path.cwd()
-    target_dir = base_dir / base_folder_name
-    if not target_dir.exists() or not target_dir.is_dir():
-        print(f"`{target_dir}` does not exist or is not a directory.")
-        return []
+    root = Path(image_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Image root not found: {root}")
 
-    image_paths: List[str] = []
-    for p in target_dir.rglob("*"):
-        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg"):
-            image_paths.append(str(p.resolve()))
+    with dataset_path.open("r", encoding="utf-8") as fp:
+        raw_entries = json.load(fp)
 
-    print(f"Found {len(image_paths)} .jpg/.jpeg files under `{target_dir}`.")
-    return image_paths
+    if not isinstance(raw_entries, Sequence):
+        raise ValueError("Dataset JSON must contain a list of entries.")
 
+    entries: List[PolicySample] = []
+    for idx, entry in enumerate(raw_entries):
+        input_payload = entry.get("input", {}) if isinstance(entry, dict) else {}
+        image_field = input_payload.get("image")
+        policy_text = input_payload.get("policy")
 
-def load_policy_text(policy_file: Path | str, index: int = 0) -> str:
-    """Load the policy string located at ``index`` from ``policy_file``."""
+        if image_field is None or policy_text is None:
+            raise ValueError(
+                f"Entry {idx} in {dataset_path} is missing required input fields."
+            )
 
-    policy_path = Path(policy_file)
-    if not policy_path.exists():
-        raise FileNotFoundError(f"Policy file not found: {policy_path}")
+        relative_path = _normalise_relative_path(str(image_field))
+        label_text = _format_label_text(entry.get("output"))
 
-    with policy_path.open("r", encoding="utf-8") as fp:
-        data = json.load(fp)
-
-    policies: Sequence[str] = []
-    if isinstance(data, dict):
-        if "policy" in data:
-            policies = data["policy"]
-        elif "policies" in data:
-            policies = data["policies"]
-    elif isinstance(data, Sequence):
-        policies = data
-
-    if not policies:
-        raise ValueError(f"No policies found in policy file: {policy_path}")
-
-    if not 0 <= index < len(policies):
-        index = 0
-
-    return policies[index]
-
-
-def gather_image_paths(base_folder_name: str, limit: Optional[int] = None) -> List[str]:
-    """Collect the image paths under ``base_folder_name`` with an optional limit."""
-
-    count_jpg_in_folder(base_folder_name)
-    image_paths = get_dirs_with_jpg(base_folder_name)
-    if not image_paths:
-        raise ValueError(
-            f"No .jpg/.jpeg files were found under directory: {base_folder_name}"
+        entries.append(
+            PolicySample(
+                image_path=relative_path,
+                policy_text=str(policy_text),
+                label_text=label_text,
+            )
         )
 
-    if limit is None or limit <= 0 or len(image_paths) <= limit:
-        return image_paths
+    return entries
 
-    return random.sample(image_paths, limit)
 
-# This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
-    def __init__(self, image_paths, policy, image_size=256):
-        self.image_paths = image_paths
-        self.policy = policy
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            # transforms.ToTensor(),
-            # transforms.Normalize(
-            #     mean=(0.5, 0.5, 0.5),  # Maybe use ImageNet mean and std instead.
-            #     std=(0.5, 0.5, 0.5)
-            # ),
-        ])
+    """Dataset backed by ``PolicySample`` entries and on-disk images."""
 
-    def __len__(self):
-        return len(self.image_paths)
+    def __init__(
+        self,
+        entries: Sequence[PolicySample],
+        image_root: Path | str,
+        image_size: int = 256,
+    ) -> None:
+        self.entries = list(entries)
+        self.image_root = Path(image_root)
+        self.transform = transforms.Compose([transforms.Resize((image_size, image_size))])
 
-    def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
+    def __len__(self) -> int:  # pragma: no cover - trivial container method
+        return len(self.entries)
+
+    def __getitem__(self, idx: int):
+        sample = self.entries[idx]
+        image_path = (self.image_root / sample.image_path).resolve()
         image = Image.open(image_path).convert("RGB")
         image = self.transform(image)
+
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": sample.policy_text},
+                ],
+            }
+        ]
+
         return {
             "image": image,
-            "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": self.policy},
-                    ],
-                },
-            ],
+            "conversation": conversation,
+            "label_text": sample.label_text,
         }
-def apply_chat_template_to_batch(conversations, processor, add_generation_prompt=False):
-    """Apply the chat template to a batch of conversations."""
-    prompts = []
+
+
+def apply_chat_template_to_batch(
+    conversations: Iterable[Sequence[dict]],
+    processor,
+    add_generation_prompt: bool = False,
+) -> List[str]:
+    """Apply ``processor.apply_chat_template`` to each conversation."""
+
+    prompts: List[str] = []
     for conv in conversations:
         prompt = processor.apply_chat_template(
             conv,
@@ -132,14 +167,15 @@ def apply_chat_template_to_batch(conversations, processor, add_generation_prompt
         prompts.append(prompt)
     return prompts
 
+
 def build_policy_collate_fn(
-        processor,
-        add_generation_prompt=False,
-        padding=False,
-        return_tensors="pt",
-        **processor_kwargs
+    processor,
+    add_generation_prompt: bool = True,
+    padding: bool | str = True,
+    return_tensors: str = "pt",
+    **processor_kwargs,
 ):
-    """Create a collate function that batches samples with the processor."""
+    """Create a collate function that batches samples with ``processor``."""
 
     def collate_fn(batch):
         if not batch:
@@ -147,6 +183,8 @@ def build_policy_collate_fn(
 
         images = [sample["image"] for sample in batch]
         conversations = [sample["conversation"] for sample in batch]
+        targets = [sample["label_text"] for sample in batch]
+
         prompts = apply_chat_template_to_batch(
             conversations,
             processor,
@@ -156,6 +194,7 @@ def build_policy_collate_fn(
         return processor(
             text=prompts,
             images=images,
+            text_target=targets,
             padding=padding,
             return_tensors=return_tensors,
             **processor_kwargs,
@@ -165,17 +204,18 @@ def build_policy_collate_fn(
 
 
 def create_policy_dataloader(
-    image_paths: Sequence[str],
-    policy_text: str,
+    dataset_json: Path | str,
+    image_root: Path | str,
     processor,
     *,
     batch_size: int,
     image_size: int,
     shuffle: bool = True,
 ) -> DataLoader:
-    """Build a dataloader for the policy-conditioned image dataset."""
+    """Instantiate a ``DataLoader`` backed by the labelled policy dataset."""
 
-    dataset = PolicyImageDataset(image_paths, policy_text, image_size=image_size)
+    entries = load_split_entries(dataset_json, image_root)
+    dataset = PolicyImageDataset(entries, image_root=image_root, image_size=image_size)
     collate_fn = build_policy_collate_fn(
         processor,
         add_generation_prompt=True,
