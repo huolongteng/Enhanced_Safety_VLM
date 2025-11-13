@@ -116,10 +116,25 @@ def build_policy_collate_fn(
             add_generation_prompt=add_generation_prompt,
         )
 
+        image_token = getattr(processor, "image_token", "<image>")
+        aligned_images = []
+        for sample_image, prompt in zip(images, prompts):
+            token_uses = prompt.count(image_token)
+            if token_uses <= 1:
+                aligned_images.append(sample_image)
+            else:
+                aligned_images.append([sample_image] * token_uses)
+
+        # Pad tokenized prompts when tensors are requested to avoid shape
+        # mismatches caused by variable text lengths across samples.
+        effective_padding = padding
+        if return_tensors == "pt" and padding is False:
+            effective_padding = "longest"
+
         return processor(
             text=prompts,
-            images=images,
-            padding=padding,
+            images=aligned_images,
+            padding=effective_padding,
             return_tensors=return_tensors,
             **processor_kwargs,
         )
@@ -134,7 +149,7 @@ def create_dataloader(
     batch_size=1,
     shuffle=False,
     image_size=256,
-    add_generation_prompt=True,
+    add_generation_prompt=False,
     padding=False,
     return_tensors="pt",
     num_workers=0,
@@ -252,7 +267,7 @@ if __name__ == "__main__":
     train_dataloader = create_dataloader(
         train_json_path,
         processor=processor,  # Replace with actual processor
-        batch_size=4,
+        batch_size=64,
     )
 
 
