@@ -127,8 +127,89 @@ def build_policy_collate_fn(
     return collate_fn
 
 
-def create_dataloader():
-    return None
+def create_dataloader(
+    json_path,
+    processor,
+    *,
+    batch_size=1,
+    shuffle=False,
+    image_size=256,
+    add_generation_prompt=False,
+    padding=False,
+    return_tensors="pt",
+    num_workers=0,
+    pin_memory=False,
+    drop_last=False,
+    persistent_workers=False,
+    **processor_kwargs,
+):
+    """Create a ``torch.utils.data.DataLoader`` ready for training or evaluation.
+
+    Parameters
+    ----------
+    json_path: str or pathlib.Path
+        Path to the JSON dataset file containing ``input.image``, ``input.policy``
+        and ``output.response`` entries.
+    processor: callable
+        Processor (typically a HuggingFace processor) used to collate samples into
+        tensors. It must expose an ``apply_chat_template`` method.
+    batch_size: int, optional
+        Number of samples to load per batch. Defaults to ``1``.
+    shuffle: bool, optional
+        Whether to shuffle the dataset at every epoch. Defaults to ``False``.
+    image_size: int, optional
+        Target square size for the images before feeding them to the processor.
+    add_generation_prompt: bool, optional
+        Forwarded to :func:`build_policy_collate_fn` so the processor can append a
+        generation prompt when required.
+    padding, return_tensors: optional
+        Passed through to the processor when batching.
+    num_workers, pin_memory, drop_last, persistent_workers: optional
+        Standard ``DataLoader`` arguments forwarded as-is.
+    **processor_kwargs
+        Additional keyword arguments passed directly to the processor.
+
+    Returns
+    -------
+    DataLoader
+        A PyTorch dataloader yielding batches of processed multimodal examples.
+    """
+
+    image_paths, policy_texts, response_texts = read_images_policies_responses_paths(json_path)
+
+    if not (len(image_paths) == len(policy_texts) == len(response_texts)):
+        raise ValueError(
+            "Dataset fields have mismatched lengths: "
+            f"images={len(image_paths)}, policies={len(policy_texts)}, responses={len(response_texts)}"
+        )
+
+    dataset = PolicyImageDataset(
+        image_paths,
+        policy_texts,
+        response_texts,
+        image_size=image_size,
+    )
+
+    collate_fn = build_policy_collate_fn(
+        processor,
+        add_generation_prompt=add_generation_prompt,
+        padding=padding,
+        return_tensors=return_tensors,
+        **processor_kwargs,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+    )
+
+    return dataloader
 
 def rewrite_image_paths(json_path, image_dir_prefix):
     """
