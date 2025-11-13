@@ -1,4 +1,4 @@
-"""Training helpers for the knowledge-distillation workflow."""
+"""Training helpers for supervised fine-tuning of multimodal models."""
 from __future__ import annotations
 from dataclasses import dataclass
 import math
@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Iterable, Sequence
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.optimization import get_cosine_schedule_with_warmup
 
@@ -35,8 +34,8 @@ DEFAULT_LORA_TARGET_MODULES: tuple[str, ...] = (
 
 
 @dataclass
-class DistillationStats:
-    """Container for metrics gathered during training.
+class TrainingStats:
+    """Container for metrics gathered during supervised training.
 
     Attributes
     ----------
@@ -95,16 +94,90 @@ def seed_everything(seed: int) -> None:
 
 
 def _move_batch_to_device(batch, device):
-    """Move every tensor in batch to device."""
+    """Move tensors contained in ``batch`` to ``device`` (labels included)."""
+
     if device is None:
         return batch
-    moved = {}
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            moved[key] = value.to(device)
-        else:
-            moved[key] = value
-    return moved
+
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+
+    # ``BatchEncoding``/``BatchFeature`` objects expose ``to`` and support
+    # in-place device transfer for every contained tensor (``labels`` included).
+    to_method = getattr(batch, "to", None)
+    if callable(to_method):
+        try:
+            return to_method(device)
+        except TypeError:
+            # Some containers expose ``to`` with a different signature.  Fall
+            # back to item-wise recursion below when that happens.
+            pass
+
+    if isinstance(batch, dict):
+        return {key: _move_batch_to_device(value, device) for key, value in batch.items()}
+
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(_move_batch_to_device(value, device) for value in batch)
+
+    return batch
+
+
+def supervised_step(
+    student_model,
+    optimizer,
+    batch,
+    *,
+    device,
+    loss_scale: float = 1.0,
+    grad_scaler: "torch.cuda.amp.GradScaler" | None = None,
+):
+    """Execute a supervised optimisation step for ``student_model``.
+
+    The step performs a forward pass using ``batch`` (which must include
+    ``labels`` so that Hugging Face computes the loss) and backpropagates the
+    scaled loss.  Optimizer stepping and zero-grad handling remain the
+    responsibility of the outer training loop to preserve gradient accumulation
+    semantics.
+    """
+
+    if optimizer is None:
+        raise ValueError("An optimizer instance must be provided for supervised_step().")
+
+    if loss_scale <= 0:
+        raise ValueError("loss_scale must be a positive value.")
+
+    model_inputs = _move_batch_to_device(batch, device)
+
+    if optimizer.param_groups:
+        first_param = next(
+            (
+                param
+                for group in optimizer.param_groups
+                for param in group.get("params", [])
+                if param is not None
+            ),
+            None,
+        )
+        if first_param is not None and first_param.device != device:
+            raise ValueError(
+                "Optimizer parameters are not on the target device; make sure the model "
+                "has been moved before training."
+            )
+
+    outputs = student_model(**model_inputs)
+    loss = getattr(outputs, "loss", None)
+    if loss is None:
+        raise ValueError(
+            "Model outputs did not include a loss. Ensure labels are provided in the batch."
+        )
+
+    scaled_loss = loss / float(loss_scale)
+    if grad_scaler is not None:
+        grad_scaler.scale(scaled_loss).backward()
+    else:
+        scaled_loss.backward()
+
+    return float(loss.detach().cpu().item()), outputs
 
 
 def apply_lora_adapters(
@@ -197,249 +270,18 @@ def freeze_student_vision_and_projector(student_model) -> list[str]:
     return frozen_components
 
 
-def forward_teacher_student(
-    teacher_model,
-    student_model,
-    batch,
-    device,
-):
-    """Run a forward pass for both teacher and student on ``batch``."""
-    model_inputs = _move_batch_to_device(batch, device)
-
-    with torch.no_grad():
-        teacher_outputs = teacher_model(**model_inputs)
-
-    student_outputs = student_model(**model_inputs)
-    return teacher_outputs, student_outputs, model_inputs
-
-
-def compute_kd_loss(
-    student_logits,
-    teacher_logits,
-    attention_mask,
-    temperature=1.0,
-):
-    """Compute the standard KL-divergence loss for knowledge distillation."""
-
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-
-    student_log_probs = student_log_probs.view(-1, student_log_probs.size(-1))
-    teacher_probs = teacher_probs.view(-1, teacher_probs.size(-1))
-
-    if attention_mask is not None:
-        flat_mask = attention_mask.view(-1).bool()
-        if flat_mask.any():
-            student_log_probs = student_log_probs[flat_mask]
-            teacher_probs = teacher_probs[flat_mask]
-        else:
-            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
-
-    kd = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
-
-    return kd * (temperature**2)
-
-
-def _extract_projector_hidden_states(model_outputs) -> torch.Tensor | None:
-    """Return the projector hidden states tensor if the model exposes it."""
-
-    if model_outputs is None:
-        return None
-
-    candidate = None
-    for attr in (
-        "projector_hidden_states",
-        "multi_modal_projector_hidden_states",
-        "multimodal_projector_hidden_states",
-        "vision_projector_hidden_states",
-    ):
-        if hasattr(model_outputs, attr):
-            candidate = getattr(model_outputs, attr)
-            break
-
-    if candidate is None and isinstance(model_outputs, dict):
-        for key in (
-            "projector_hidden_states",
-            "multi_modal_projector_hidden_states",
-            "multimodal_projector_hidden_states",
-            "vision_projector_hidden_states",
-        ):
-            if key in model_outputs:
-                candidate = model_outputs[key]
-                break
-
-    if candidate is None:
-        return None
-
-    if isinstance(candidate, (list, tuple)) and candidate:
-        candidate = candidate[-1]
-
-    if not isinstance(candidate, torch.Tensor):
-        return None
-
-    return candidate
-
-
-def _reshape_projector_tokens(states: torch.Tensor) -> torch.Tensor:
-    """Ensure projector states are shaped as ``(batch, tokens, dim)``."""
-
-    if states.dim() == 3:
-        return states
-
-    if states.dim() < 3:
-        return states.unsqueeze(1)
-
-    return states.reshape(states.size(0), -1, states.size(-1))
-
-
-def compute_projector_alignment_loss(
-    student_outputs,
-    teacher_outputs,
-) -> torch.Tensor | None:
-    """Cosine + MSE alignment between teacher and student projector tokens."""
-
-    student_states = _extract_projector_hidden_states(student_outputs)
-    teacher_states = _extract_projector_hidden_states(teacher_outputs)
-
-    if student_states is None or teacher_states is None:
-        return None
-
-    if student_states.dim() < 2 or teacher_states.dim() < 2:
-        return None
-
-    # Align sequence length if they differ.
-    min_tokens = min(student_states.size(1), teacher_states.size(1))
-    if min_tokens <= 0:
-        return None
-    student_states = student_states[:, :min_tokens]
-    teacher_states = teacher_states[:, :min_tokens]
-
-    student_states = _reshape_projector_tokens(student_states)
-    teacher_states = _reshape_projector_tokens(teacher_states)
-
-    teacher_states = teacher_states.detach().to(student_states.dtype)
-
-    student_norm = F.normalize(student_states, dim=-1)
-    teacher_norm = F.normalize(teacher_states, dim=-1)
-
-    cosine_sim = (student_norm * teacher_norm).sum(dim=-1).mean()
-    loss_cos = 1.0 - cosine_sim
-    loss_mse = F.mse_loss(student_states, teacher_states)
-
-    return loss_cos + 0.1 * loss_mse
-
-
-def distillation_step(
-    teacher_model,
-    student_model,
-    optimizer,
-    batch,
-    *,
-    device,
-    temperature: float,
-    projector_loss_weight: float,
-    loss_scale: float = 1.0,
-    zero_grad: bool = True,
-    step_optimizer: bool = True,
-    zero_after_step: bool = True,
-) -> float:
-    """Perform a single optimization step of knowledge distillation.
-
-    Parameters
-    ----------
-    loss_scale:
-        Multiplicative factor applied to the computed loss before calling
-        ``backward``.  Useful for gradient accumulation to average the
-        gradients across multiple batches.
-    zero_grad:
-        When ``True`` the optimizer gradients are cleared before the backward
-        pass.  Disable this when accumulating gradients across batches.
-    step_optimizer:
-        Whether to execute ``optimizer.step`` at the end of the function.
-    zero_after_step:
-        When ``True`` and ``step_optimizer`` is enabled the gradients are
-        cleared after the update.  Disable to manage gradient buffers
-        externally.
-    """
-
-    teacher_outputs, student_outputs, model_inputs = forward_teacher_student(
-        teacher_model,
-        student_model,
-        batch,
-        device,
-    )
-
-    attention_mask = model_inputs.get("attention_mask")
-    kd_loss = compute_kd_loss(
-        student_outputs.logits,
-        teacher_outputs.logits,
-        attention_mask,
-        temperature=temperature,
-    )
-
-    total_loss = kd_loss
-    projector_loss = None
-    if projector_loss_weight > 0.0:
-        projector_loss = compute_projector_alignment_loss(
-            student_outputs,
-            teacher_outputs,
-        )
-        if projector_loss is not None:
-            mix = max(0.0, min(1.0, projector_loss_weight))
-            total_loss = (1.0 - mix) * kd_loss + mix * projector_loss
-
-    if zero_grad:
-        optimizer.zero_grad()
-
-    scaled_loss = total_loss * loss_scale
-    scaled_loss.backward()
-
-    if step_optimizer:
-        optimizer.step()
-        if zero_after_step:
-            optimizer.zero_grad()
-
-    return float(total_loss.item())
-
-
-def run_kd_training(
-    teacher_model,
+def run_supervised_training(
     student_model,
     dataloader: Iterable,
     *,
     device,
     learning_rate: float,
-    temperature: float,
     num_epochs: int,
-    projector_loss_weight: float = 1.0,
     gradient_accumulation_steps: int = 1,
     early_stopping: EarlyStoppingConfig | None = None,
-) -> DistillationStats:
-    """Train ``student_model`` to mimic ``teacher_model`` using ``dataloader``.
+) -> TrainingStats:
+    """Train ``student_model`` on labelled batches yielded by ``dataloader``."""
 
-    Parameters
-    ----------
-    teacher_model, student_model:
-        Hugging Face compatible causal language models participating in the
-        knowledge distillation process.
-    dataloader:
-        Iterable that yields tokenized batches for training.
-    device:
-        Hardware accelerator on which the models should be executed.
-    learning_rate, temperature, num_epochs, projector_loss_weight:
-        Hyper-parameters controlling the optimization dynamics.
-    gradient_accumulation_steps:
-        Number of consecutive batches to accumulate before performing an
-        optimizer step.  ``1`` disables accumulation and updates the model
-        after every batch.
-    early_stopping:
-        Optional configuration structure.  When provided and enabled the
-        training loop monitors the epoch loss and halts once the patience
-        threshold is exhausted.
-    """
-
-    teacher_model.eval()
-    teacher_model.to(device)
     student_model.to(device)
 
     frozen_parts = freeze_student_vision_and_projector(student_model)
@@ -453,7 +295,6 @@ def run_kd_training(
         raise ValueError("gradient_accumulation_steps must be >= 1")
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
-
     scheduler = None
 
     epoch_losses: list[float] = []
@@ -462,7 +303,6 @@ def run_kd_training(
 
     batch_size = getattr(dataloader, "batch_size", None)
 
-    steps_per_epoch = None
     try:
         steps_per_epoch = len(dataloader)
     except TypeError:
@@ -489,9 +329,6 @@ def run_kd_training(
         leave=False,
     )
 
-    # Prepare bookkeeping variables required for early stopping.  When the
-    # heuristic is disabled we simply leave ``early_cfg`` as ``None`` so that
-    # the training loop incurs no additional overhead.
     early_cfg = early_stopping if early_stopping and early_stopping.enabled else None
     best_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
@@ -503,15 +340,15 @@ def run_kd_training(
         student_model.train()
         running_loss = 0.0
         num_batches = 0
+        accumulation_loss = 0.0
+        accumulated_batches = 0
+        current_cycle_size = gradient_accumulation_steps
 
         progress_bar.set_description(f"Training (epoch {epoch + 1}/{num_epochs})")
 
-        accumulated_batches = 0
-        accumulation_loss = 0.0
-        current_cycle_size = gradient_accumulation_steps
-
         for batch_idx, batch in enumerate(dataloader):
             if accumulated_batches == 0:
+                optimizer.zero_grad()
                 if steps_per_epoch is not None and steps_per_epoch > 0:
                     remaining_batches = steps_per_epoch - batch_idx
                     current_cycle_size = min(
@@ -521,105 +358,73 @@ def run_kd_training(
                 else:
                     current_cycle_size = gradient_accumulation_steps
 
-            accumulated_batches += 1
-
-            zero_grad = accumulated_batches == 1
-            should_step = accumulated_batches >= current_cycle_size
-
-            loss_value = distillation_step(
-                teacher_model,
+            loss_value, _ = supervised_step(
                 student_model,
                 optimizer,
                 batch,
                 device=device,
-                temperature=temperature,
-                projector_loss_weight=projector_loss_weight,
-                loss_scale=1.0 / max(1, current_cycle_size),
-                zero_grad=zero_grad,
-                step_optimizer=should_step,
-                zero_after_step=should_step,
+                loss_scale=float(current_cycle_size),
             )
-
             running_loss += loss_value
-            num_batches += 1
             accumulation_loss += loss_value
+            num_batches += 1
+
+            accumulated_batches += 1
+
             progress_bar.update(1)
 
-            if should_step:
-                cycle_batch_count = accumulated_batches
-                average_cycle_loss = accumulation_loss / max(1, cycle_batch_count)
-                step_losses.append(average_cycle_loss)
-                global_step += 1
-                accumulation_loss = 0.0
-                accumulated_batches = 0
-
+            if accumulated_batches >= current_cycle_size:
+                optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
+                optimizer.zero_grad()
+
+                average_cycle_loss = accumulation_loss / float(accumulated_batches)
+                step_losses.append(average_cycle_loss)
+                accumulation_loss = 0.0
+                accumulated_batches = 0
+                global_step += 1
 
         if accumulated_batches > 0:
-            correction = (
-                current_cycle_size / max(1, accumulated_batches)
-                if current_cycle_size != accumulated_batches
-                else 1.0
-            )
-            if correction != 1.0:
-                for group in optimizer.param_groups:
-                    for param in group["params"]:
-                        if param.grad is not None:
-                            param.grad.mul_(correction)
-
             optimizer.step()
-            optimizer.zero_grad()
-
-            cycle_batch_count = accumulated_batches
-            average_cycle_loss = accumulation_loss / max(1, cycle_batch_count)
-            step_losses.append(average_cycle_loss)
-            global_step += 1
-            accumulated_batches = 0
-            accumulation_loss = 0.0
-
             if scheduler is not None:
                 scheduler.step()
+            optimizer.zero_grad()
 
-        average_loss = running_loss / max(num_batches, 1)
-        epoch_losses.append(average_loss)
+            average_cycle_loss = accumulation_loss / float(accumulated_batches)
+            step_losses.append(average_cycle_loss)
+            accumulation_loss = 0.0
+            accumulated_batches = 0
+            global_step += 1
 
-        current_lr = optimizer.param_groups[0]["lr"]
+        epoch_loss = running_loss / max(1, num_batches)
+        epoch_losses.append(epoch_loss)
+
         metrics = [
             f"Epoch {epoch + 1}/{num_epochs}",
-            f"average_loss={average_loss:.4f}",
-            f"lr={current_lr:.6g}",
-            f"temperature={temperature:.2f}",
+            f"average_loss={epoch_loss:.4f}",
+            f"lr={optimizer.param_groups[0]['lr']:.6g}",
         ]
         if batch_size is not None:
             metrics.append(f"batch_size={batch_size}")
-        metrics.append(f"steps={global_step}")
+        metrics.append(f"optimizer_steps={global_step}")
 
         progress_bar.write(" | ".join(metrics))
         if total_batches is None:
             progress_bar.refresh()
 
         if early_cfg is not None:
-            # Determine whether the current epoch improved upon the best loss by
-            # at least ``min_delta``.  Improvements reset the patience counter
-            # and optionally store a CPU copy of the student weights so the best
-            # checkpoint can be restored after the loop terminates.
-            if average_loss + early_cfg.min_delta < best_loss:
-                best_loss = average_loss
+            if epoch_loss + early_cfg.min_delta < best_loss:
+                best_loss = epoch_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in student_model.state_dict().items()}
                 best_epoch = epoch
                 epochs_without_improve = 0
-                if early_cfg.restore_best_weights:
-                    best_state = {
-                        key: value.detach().cpu().clone()
-                        for key, value in student_model.state_dict().items()
-                    }
+                progress_bar.write(
+                    f"New best model found at epoch {epoch + 1} with loss {epoch_loss:.4f}."
+                )
             else:
                 epochs_without_improve += 1
 
-            # Once the patience budget is exceeded and the minimum epoch
-            # requirement is satisfied we stop training early.  The message is
-            # printed via the progress bar so it appears alongside the other
-            # training logs.
             if (
                 (epoch + 1) >= max(1, early_cfg.min_epochs)
                 and epochs_without_improve >= max(1, early_cfg.patience)
@@ -635,16 +440,13 @@ def run_kd_training(
     progress_bar.close()
 
     if early_cfg is not None and early_cfg.restore_best_weights and best_state is not None:
-        # Restoring the best-performing checkpoint ensures downstream uses such
-        # as artifact saving export the most effective model rather than the one
-        # from the final (possibly suboptimal) epoch.
         student_model.load_state_dict(best_state)
 
-    return DistillationStats(
+    return TrainingStats(
         epoch_losses=epoch_losses,
         step_losses=step_losses,
         best_epoch=None if best_epoch is None else best_epoch + 1,
-        best_loss=None if best_loss == float("inf") else best_loss,
+        best_loss=None if best_loss == float('inf') else best_loss,
         early_stopped=stopped_early,
     )
 
@@ -658,7 +460,7 @@ def _save_epoch_plot(epoch_losses: Sequence[float], output_dir: Path) -> None:
     plt.plot(epochs, epoch_losses, marker="o", label="Epoch Avg Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Average Loss")
-    plt.title("Knowledge Distillation Training Loss (Epoch)")
+    plt.title("Supervised Training Loss (Epoch)")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -680,7 +482,7 @@ def _save_step_plot(step_losses: Sequence[float], output_dir: Path, stride: int)
     plt.plot(steps_plot, losses_plot, label=f"Step Loss (every {stride})")
     plt.xlabel("Training Step")
     plt.ylabel("Loss")
-    plt.title("Knowledge Distillation Training Loss (Step)")
+    plt.title("Supervised Training Loss (Step)")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -692,13 +494,13 @@ def _save_step_plot(step_losses: Sequence[float], output_dir: Path, stride: int)
 
 def save_training_artifacts(
     student_model,
-    stats: DistillationStats,
+    stats: TrainingStats,
     output_dir: Path,
     *,
     step_stride: int,
     checkpoint_name: str = "student_model_state.pt",
 ) -> None:
-    """Persist the plots and checkpoint produced by ``run_kd_training``."""
+    """Persist the plots and checkpoint produced by ``run_supervised_training``."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _save_epoch_plot(stats.epoch_losses, output_dir)

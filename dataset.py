@@ -2,11 +2,95 @@
 import json
 import random
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+
+def _ensure_posix_path(path_str: str) -> str:
+    """Normalize Windows style paths to POSIX style strings."""
+
+    return path_str.replace("\\", "/")
+
+
+def _format_label_text(output: Dict[str, Any]) -> str:
+    """Create a human readable label string from the output dictionary."""
+
+    parts: List[str] = []
+    rating = output.get("rating")
+    if rating:
+        parts.append(f"Rating: {rating}")
+
+    category = output.get("category")
+    if category:
+        parts.append(f"Category: {category}")
+
+    rationale = output.get("rationale")
+    if rationale:
+        parts.append(f"Rationale: {rationale}")
+
+    if not parts:
+        # Fall back to the original representation when structured fields are missing.
+        return json.dumps(output, ensure_ascii=False)
+
+    return "\n".join(parts)
+
+
+def load_split_entries(dataset_json: Path | str, image_root: Path | str) -> List[Dict[str, Any]]:
+    """Load and normalize dataset entries from a JSON split file.
+
+    Args:
+        dataset_json: Path to the dataset JSON file containing the split entries.
+        image_root: Base path containing the image assets for the split.
+
+    Returns:
+        A list of dictionaries with normalized fields used by :class:`PolicyImageDataset`.
+    """
+
+    dataset_path = Path(dataset_json).expanduser()
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset JSON not found: {dataset_path}")
+
+    base_root = Path(image_root).expanduser().resolve(strict=False)
+    if not base_root.exists():
+        print(f"Warning: image root `{base_root}` does not exist on disk.")
+
+    with dataset_path.open("r", encoding="utf-8") as fp:
+        raw_entries = json.load(fp)
+
+    normalized_entries: List[Dict[str, Any]] = []
+    for record in raw_entries:
+        input_payload = record.get("input", {}) or {}
+        output_payload = record.get("output", {})
+
+        image_field = str(input_payload.get("image", "")).strip()
+        image_rel = _ensure_posix_path(image_field)
+
+        policy_text = input_payload.get("policy", "")
+
+        if isinstance(output_payload, str):
+            try:
+                output_payload = json.loads(output_payload)
+            except json.JSONDecodeError:
+                output_payload = {"response": output_payload}
+        elif not isinstance(output_payload, dict):
+            output_payload = {"response": output_payload}
+
+        label_text = _format_label_text(output_payload)
+
+        normalized_entries.append(
+            {
+                "id": record.get("id"),
+                "image": image_rel,
+                "policy": policy_text,
+                "output": output_payload,
+                "label_text": label_text,
+            }
+        )
+
+    return normalized_entries
 
 def count_jpg_in_folder(folder_name):
     """
@@ -89,9 +173,15 @@ def gather_image_paths(base_folder_name: str, limit: Optional[int] = None) -> Li
 
 # This Dataset class loads images and prepares them with the given policy prompt.
 class PolicyImageDataset(Dataset):
-    def __init__(self, image_paths, policy, image_size=256):
-        self.image_paths = image_paths
-        self.policy = policy
+    def __init__(
+        self,
+        samples: Sequence[Dict[str, Any]],
+        *,
+        image_root: Path | str,
+        image_size: int = 256,
+    ):
+        self.samples = list(samples)
+        self.image_root = Path(image_root).expanduser().resolve(strict=False)
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             # transforms.ToTensor(),
@@ -102,23 +192,37 @@ class PolicyImageDataset(Dataset):
         ])
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.samples)
+
+    def _resolve_image_path(self, relative_path: str) -> Path:
+        normalized = _ensure_posix_path(relative_path)
+        path_obj = Path(normalized)
+        if path_obj.is_absolute():
+            return path_obj
+        return (self.image_root / path_obj).resolve()
 
     def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
+        sample = self.samples[idx]
+        image_path = self._resolve_image_path(sample["image"])
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
         image = Image.open(image_path).convert("RGB")
         image = self.transform(image)
+
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": sample.get("policy", "")},
+                ],
+            }
+        ]
+
         return {
             "image": image,
-            "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": self.policy},
-                    ],
-                },
-            ],
+            "conversation": conversation,
+            "label_text": sample.get("label_text", ""),
         }
 def apply_chat_template_to_batch(conversations, processor, add_generation_prompt=False):
     """Apply the chat template to a batch of conversations."""
@@ -133,11 +237,11 @@ def apply_chat_template_to_batch(conversations, processor, add_generation_prompt
     return prompts
 
 def build_policy_collate_fn(
-        processor,
-        add_generation_prompt=False,
-        padding=False,
-        return_tensors="pt",
-        **processor_kwargs
+    processor,
+    add_generation_prompt: bool = False,
+    padding: bool | str = False,
+    return_tensors: str = "pt",
+    **processor_kwargs,
 ):
     """Create a collate function that batches samples with the processor."""
 
@@ -147,6 +251,8 @@ def build_policy_collate_fn(
 
         images = [sample["image"] for sample in batch]
         conversations = [sample["conversation"] for sample in batch]
+        targets = [sample.get("label_text", "") for sample in batch]
+
         prompts = apply_chat_template_to_batch(
             conversations,
             processor,
@@ -156,6 +262,7 @@ def build_policy_collate_fn(
         return processor(
             text=prompts,
             images=images,
+            text_target=targets,
             padding=padding,
             return_tensors=return_tensors,
             **processor_kwargs,
@@ -165,17 +272,26 @@ def build_policy_collate_fn(
 
 
 def create_policy_dataloader(
-    image_paths: Sequence[str],
-    policy_text: str,
+    data: Sequence[Dict[str, Any]] | Path | str,
+    image_root: Path | str,
     processor,
     *,
     batch_size: int,
     image_size: int,
     shuffle: bool = True,
 ) -> DataLoader:
-    """Build a dataloader for the policy-conditioned image dataset."""
+    """Build a dataloader for policy-conditioned image datasets with labels."""
 
-    dataset = PolicyImageDataset(image_paths, policy_text, image_size=image_size)
+    if isinstance(data, (str, Path)):
+        samples = load_split_entries(data, image_root)
+    else:
+        samples = list(data)
+
+    if not samples:
+        raise ValueError("No samples available to build the dataloader.")
+
+    dataset = PolicyImageDataset(samples, image_root=image_root, image_size=image_size)
+
     collate_fn = build_policy_collate_fn(
         processor,
         add_generation_prompt=True,
