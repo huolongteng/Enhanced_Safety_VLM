@@ -94,16 +94,90 @@ def seed_everything(seed: int) -> None:
 
 
 def _move_batch_to_device(batch, device):
-    """Move every tensor in batch to device."""
+    """Move tensors contained in ``batch`` to ``device`` (labels included)."""
+
     if device is None:
         return batch
-    moved = {}
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            moved[key] = value.to(device)
-        else:
-            moved[key] = value
-    return moved
+
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+
+    # ``BatchEncoding``/``BatchFeature`` objects expose ``to`` and support
+    # in-place device transfer for every contained tensor (``labels`` included).
+    to_method = getattr(batch, "to", None)
+    if callable(to_method):
+        try:
+            return to_method(device)
+        except TypeError:
+            # Some containers expose ``to`` with a different signature.  Fall
+            # back to item-wise recursion below when that happens.
+            pass
+
+    if isinstance(batch, dict):
+        return {key: _move_batch_to_device(value, device) for key, value in batch.items()}
+
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(_move_batch_to_device(value, device) for value in batch)
+
+    return batch
+
+
+def supervised_step(
+    student_model,
+    optimizer,
+    batch,
+    *,
+    device,
+    loss_scale: float = 1.0,
+    grad_scaler: "torch.cuda.amp.GradScaler" | None = None,
+):
+    """Execute a supervised optimisation step for ``student_model``.
+
+    The step performs a forward pass using ``batch`` (which must include
+    ``labels`` so that Hugging Face computes the loss) and backpropagates the
+    scaled loss.  Optimizer stepping and zero-grad handling remain the
+    responsibility of the outer training loop to preserve gradient accumulation
+    semantics.
+    """
+
+    if optimizer is None:
+        raise ValueError("An optimizer instance must be provided for supervised_step().")
+
+    if loss_scale <= 0:
+        raise ValueError("loss_scale must be a positive value.")
+
+    model_inputs = _move_batch_to_device(batch, device)
+
+    if optimizer.param_groups:
+        first_param = next(
+            (
+                param
+                for group in optimizer.param_groups
+                for param in group.get("params", [])
+                if param is not None
+            ),
+            None,
+        )
+        if first_param is not None and first_param.device != device:
+            raise ValueError(
+                "Optimizer parameters are not on the target device; make sure the model "
+                "has been moved before training."
+            )
+
+    outputs = student_model(**model_inputs)
+    loss = getattr(outputs, "loss", None)
+    if loss is None:
+        raise ValueError(
+            "Model outputs did not include a loss. Ensure labels are provided in the batch."
+        )
+
+    scaled_loss = loss / float(loss_scale)
+    if grad_scaler is not None:
+        grad_scaler.scale(scaled_loss).backward()
+    else:
+        scaled_loss.backward()
+
+    return float(loss.detach().cpu().item()), outputs
 
 
 def apply_lora_adapters(
@@ -284,21 +358,17 @@ def run_supervised_training(
                 else:
                     current_cycle_size = gradient_accumulation_steps
 
-            model_inputs = _move_batch_to_device(batch, device)
-            outputs = student_model(**model_inputs)
-            loss = getattr(outputs, "loss", None)
-            if loss is None:
-                raise ValueError(
-                    "Model outputs did not include a loss. Ensure labels are provided in the batch."
-                )
-
-            loss_value = float(loss.detach().cpu().item())
+            loss_value, _ = supervised_step(
+                student_model,
+                optimizer,
+                batch,
+                device=device,
+                loss_scale=float(current_cycle_size),
+            )
             running_loss += loss_value
             accumulation_loss += loss_value
             num_batches += 1
 
-            scaled_loss = loss / float(current_cycle_size)
-            scaled_loss.backward()
             accumulated_batches += 1
 
             progress_bar.update(1)
