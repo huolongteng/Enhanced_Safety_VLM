@@ -29,7 +29,7 @@ logging.set_verbosity_error()
 # ---------------------------------------------------------------------------
 
 TRAIN_DATASET_PATH = Path("data/train_dataset.json")
-IMAGE_ROOT = Path("/data")
+IMAGE_ROOT = TRAIN_DATASET_PATH.parent
 STUDENT_MODEL_PATH = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"
 NUM_EPOCHS = 3
 BATCH_SIZE = 1
@@ -116,10 +116,11 @@ def _collect_sample_paths(
         image_rel = sample.get("image")
         if not image_rel:
             continue
-        path = Path(image_rel)
+        normalized = str(image_rel).replace("\\", "/")
+        path = Path(normalized)
         if not path.is_absolute():
             path = image_root / path
-        resolved.append(path)
+        resolved.append(path.resolve(strict=False))
     return resolved
 
 
@@ -132,11 +133,35 @@ def main(config: KDConfig | None = None) -> TrainingStats:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    samples = load_split_entries(cfg.train_dataset_path, cfg.image_root)
+    train_dataset_path = Path(cfg.train_dataset_path).expanduser().resolve(strict=False)
+    if not train_dataset_path.exists():
+        raise FileNotFoundError(f"Dataset JSON not found: {train_dataset_path}")
+
+    configured_root = Path(cfg.image_root).expanduser()
+    if configured_root.is_absolute():
+        image_root = configured_root.resolve(strict=False)
+    else:
+        image_root = (train_dataset_path.parent / configured_root).resolve(strict=False)
+
+    if not image_root.exists():
+        fallback_root = train_dataset_path.parent
+        if fallback_root.exists():
+            print(
+                "Warning: image root `{missing}` does not exist. "
+                "Falling back to dataset directory `{fallback}`.".format(
+                    missing=image_root,
+                    fallback=fallback_root,
+                )
+            )
+            image_root = fallback_root
+        else:
+            print(f"Warning: image root `{image_root}` does not exist on disk.")
+
+    samples = load_split_entries(train_dataset_path, image_root)
     if not samples:
         raise ValueError("No training samples were loaded from the dataset split.")
 
-    sample_paths = _collect_sample_paths(samples, cfg.image_root)
+    sample_paths = _collect_sample_paths(samples, image_root)
     if sample_paths:
         _filter_valid_images(sample_paths[:50])
 
@@ -144,7 +169,7 @@ def main(config: KDConfig | None = None) -> TrainingStats:
 
     dataloader = create_policy_dataloader(
         samples,
-        cfg.image_root,
+        image_root,
         processor,
         batch_size=cfg.batch_size,
         image_size=cfg.image_size,

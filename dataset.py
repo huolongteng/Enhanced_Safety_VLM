@@ -49,11 +49,11 @@ def load_split_entries(dataset_json: Path | str, image_root: Path | str) -> List
         A list of dictionaries with normalized fields used by :class:`PolicyImageDataset`.
     """
 
-    dataset_path = Path(dataset_json)
+    dataset_path = Path(dataset_json).expanduser()
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset JSON not found: {dataset_path}")
 
-    base_root = Path(image_root)
+    base_root = Path(image_root).expanduser().resolve(strict=False)
     if not base_root.exists():
         print(f"Warning: image root `{base_root}` does not exist on disk.")
 
@@ -65,7 +65,7 @@ def load_split_entries(dataset_json: Path | str, image_root: Path | str) -> List
         input_payload = record.get("input", {}) or {}
         output_payload = record.get("output", {})
 
-        image_field = str(input_payload.get("image", ""))
+        image_field = str(input_payload.get("image", "")).strip()
         image_rel = _ensure_posix_path(image_field)
 
         policy_text = input_payload.get("policy", "")
@@ -181,7 +181,7 @@ class PolicyImageDataset(Dataset):
         image_size: int = 256,
     ):
         self.samples = list(samples)
-        self.image_root = Path(image_root)
+        self.image_root = Path(image_root).expanduser().resolve(strict=False)
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             # transforms.ToTensor(),
@@ -195,14 +195,17 @@ class PolicyImageDataset(Dataset):
         return len(self.samples)
 
     def _resolve_image_path(self, relative_path: str) -> Path:
-        path_obj = Path(relative_path)
+        normalized = _ensure_posix_path(relative_path)
+        path_obj = Path(normalized)
         if path_obj.is_absolute():
             return path_obj
-        return self.image_root / path_obj
+        return (self.image_root / path_obj).resolve()
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
         image_path = self._resolve_image_path(sample["image"])
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
         image = Image.open(image_path).convert("RGB")
         image = self.transform(image)
 
