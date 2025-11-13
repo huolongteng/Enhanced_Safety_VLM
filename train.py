@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.optimization import get_cosine_schedule_with_warmup
 
@@ -196,32 +197,201 @@ def freeze_student_vision_and_projector(student_model) -> list[str]:
     return frozen_components
 
 
-def supervised_step(
+def forward_teacher_student(
+    teacher_model,
+    student_model,
+    batch,
+    device,
+):
+    """Run a forward pass for both teacher and student on ``batch``."""
+    model_inputs = _move_batch_to_device(batch, device)
+
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**model_inputs)
+
+    student_outputs = student_model(**model_inputs)
+    return teacher_outputs, student_outputs, model_inputs
+
+
+def compute_kd_loss(
+    student_logits,
+    teacher_logits,
+    attention_mask,
+    temperature=1.0,
+):
+    """Compute the standard KL-divergence loss for knowledge distillation."""
+
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+    student_log_probs = student_log_probs.view(-1, student_log_probs.size(-1))
+    teacher_probs = teacher_probs.view(-1, teacher_probs.size(-1))
+
+    if attention_mask is not None:
+        flat_mask = attention_mask.view(-1).bool()
+        if flat_mask.any():
+            student_log_probs = student_log_probs[flat_mask]
+            teacher_probs = teacher_probs[flat_mask]
+        else:
+            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
+
+    kd = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
+    return kd * (temperature**2)
+
+
+def _extract_projector_hidden_states(model_outputs) -> torch.Tensor | None:
+    """Return the projector hidden states tensor if the model exposes it."""
+
+    if model_outputs is None:
+        return None
+
+    candidate = None
+    for attr in (
+        "projector_hidden_states",
+        "multi_modal_projector_hidden_states",
+        "multimodal_projector_hidden_states",
+        "vision_projector_hidden_states",
+    ):
+        if hasattr(model_outputs, attr):
+            candidate = getattr(model_outputs, attr)
+            break
+
+    if candidate is None and isinstance(model_outputs, dict):
+        for key in (
+            "projector_hidden_states",
+            "multi_modal_projector_hidden_states",
+            "multimodal_projector_hidden_states",
+            "vision_projector_hidden_states",
+        ):
+            if key in model_outputs:
+                candidate = model_outputs[key]
+                break
+
+    if candidate is None:
+        return None
+
+    if isinstance(candidate, (list, tuple)) and candidate:
+        candidate = candidate[-1]
+
+    if not isinstance(candidate, torch.Tensor):
+        return None
+
+    return candidate
+
+
+def _reshape_projector_tokens(states: torch.Tensor) -> torch.Tensor:
+    """Ensure projector states are shaped as ``(batch, tokens, dim)``."""
+
+    if states.dim() == 3:
+        return states
+
+    if states.dim() < 3:
+        return states.unsqueeze(1)
+
+    return states.reshape(states.size(0), -1, states.size(-1))
+
+
+def compute_projector_alignment_loss(
+    student_outputs,
+    teacher_outputs,
+) -> torch.Tensor | None:
+    """Cosine + MSE alignment between teacher and student projector tokens."""
+
+    student_states = _extract_projector_hidden_states(student_outputs)
+    teacher_states = _extract_projector_hidden_states(teacher_outputs)
+
+    if student_states is None or teacher_states is None:
+        return None
+
+    if student_states.dim() < 2 or teacher_states.dim() < 2:
+        return None
+
+    # Align sequence length if they differ.
+    min_tokens = min(student_states.size(1), teacher_states.size(1))
+    if min_tokens <= 0:
+        return None
+    student_states = student_states[:, :min_tokens]
+    teacher_states = teacher_states[:, :min_tokens]
+
+    student_states = _reshape_projector_tokens(student_states)
+    teacher_states = _reshape_projector_tokens(teacher_states)
+
+    teacher_states = teacher_states.detach().to(student_states.dtype)
+
+    student_norm = F.normalize(student_states, dim=-1)
+    teacher_norm = F.normalize(teacher_states, dim=-1)
+
+    cosine_sim = (student_norm * teacher_norm).sum(dim=-1).mean()
+    loss_cos = 1.0 - cosine_sim
+    loss_mse = F.mse_loss(student_states, teacher_states)
+
+    return loss_cos + 0.1 * loss_mse
+
+
+def distillation_step(
+    teacher_model,
     student_model,
     optimizer,
     batch,
     *,
     device,
+    temperature: float,
+    projector_loss_weight: float,
     loss_scale: float = 1.0,
     zero_grad: bool = True,
     step_optimizer: bool = True,
     zero_after_step: bool = True,
 ) -> float:
-    """Perform a single optimization step using labelled supervision."""
+    """Perform a single optimization step of knowledge distillation.
 
-    model_inputs = _move_batch_to_device(batch, device)
-    labels = model_inputs.pop("labels", None)
+    Parameters
+    ----------
+    loss_scale:
+        Multiplicative factor applied to the computed loss before calling
+        ``backward``.  Useful for gradient accumulation to average the
+        gradients across multiple batches.
+    zero_grad:
+        When ``True`` the optimizer gradients are cleared before the backward
+        pass.  Disable this when accumulating gradients across batches.
+    step_optimizer:
+        Whether to execute ``optimizer.step`` at the end of the function.
+    zero_after_step:
+        When ``True`` and ``step_optimizer`` is enabled the gradients are
+        cleared after the update.  Disable to manage gradient buffers
+        externally.
+    """
 
-    if labels is None:
-        raise ValueError("Batch is missing `labels` required for supervised training.")
+    teacher_outputs, student_outputs, model_inputs = forward_teacher_student(
+        teacher_model,
+        student_model,
+        batch,
+        device,
+    )
+
+    attention_mask = model_inputs.get("attention_mask")
+    kd_loss = compute_kd_loss(
+        student_outputs.logits,
+        teacher_outputs.logits,
+        attention_mask,
+        temperature=temperature,
+    )
+
+    total_loss = kd_loss
+    projector_loss = None
+    if projector_loss_weight > 0.0:
+        projector_loss = compute_projector_alignment_loss(
+            student_outputs,
+            teacher_outputs,
+        )
+        if projector_loss is not None:
+            mix = max(0.0, min(1.0, projector_loss_weight))
+            total_loss = (1.0 - mix) * kd_loss + mix * projector_loss
 
     if zero_grad:
         optimizer.zero_grad()
 
-    outputs = student_model(**model_inputs, labels=labels)
-    loss = outputs.loss
-
-    scaled_loss = loss * loss_scale
+    scaled_loss = total_loss * loss_scale
     scaled_loss.backward()
 
     if step_optimizer:
@@ -229,30 +399,34 @@ def supervised_step(
         if zero_after_step:
             optimizer.zero_grad()
 
-    return float(loss.detach().item())
+    return float(total_loss.item())
 
 
 def run_kd_training(
+    teacher_model,
     student_model,
     dataloader: Iterable,
     *,
     device,
     learning_rate: float,
+    temperature: float,
     num_epochs: int,
+    projector_loss_weight: float = 1.0,
     gradient_accumulation_steps: int = 1,
     early_stopping: EarlyStoppingConfig | None = None,
 ) -> DistillationStats:
-    """Fine-tune ``student_model`` on labelled batches from ``dataloader``.
+    """Train ``student_model`` to mimic ``teacher_model`` using ``dataloader``.
 
     Parameters
     ----------
-    student_model:
-        Hugging Face compatible causal language model to be fine-tuned.
+    teacher_model, student_model:
+        Hugging Face compatible causal language models participating in the
+        knowledge distillation process.
     dataloader:
         Iterable that yields tokenized batches for training.
     device:
         Hardware accelerator on which the models should be executed.
-    learning_rate, num_epochs:
+    learning_rate, temperature, num_epochs, projector_loss_weight:
         Hyper-parameters controlling the optimization dynamics.
     gradient_accumulation_steps:
         Number of consecutive batches to accumulate before performing an
@@ -264,6 +438,8 @@ def run_kd_training(
         threshold is exhausted.
     """
 
+    teacher_model.eval()
+    teacher_model.to(device)
     student_model.to(device)
 
     frozen_parts = freeze_student_vision_and_projector(student_model)
@@ -350,11 +526,14 @@ def run_kd_training(
             zero_grad = accumulated_batches == 1
             should_step = accumulated_batches >= current_cycle_size
 
-            loss_value = supervised_step(
+            loss_value = distillation_step(
+                teacher_model,
                 student_model,
                 optimizer,
                 batch,
                 device=device,
+                temperature=temperature,
+                projector_loss_weight=projector_loss_weight,
                 loss_scale=1.0 / max(1, current_cycle_size),
                 zero_grad=zero_grad,
                 step_optimizer=should_step,
@@ -410,6 +589,7 @@ def run_kd_training(
             f"Epoch {epoch + 1}/{num_epochs}",
             f"average_loss={average_loss:.4f}",
             f"lr={current_lr:.6g}",
+            f"temperature={temperature:.2f}",
         ]
         if batch_size is not None:
             metrics.append(f"batch_size={batch_size}")
