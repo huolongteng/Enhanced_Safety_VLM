@@ -355,10 +355,13 @@ if __name__ == "__main__":
     test_json_path = "data/test_dataset.json"
     # rewrite_image_paths(train_json_path, train_image_dir_prefix)
     # rewrite_image_paths(test_json_path, test_image_dir_prefix)
-    tarin_image_paths, train_policy_lists, train_response_lists = read_images_policies_responses_paths(train_json_path)
-    test_image_paths, test_policy_lists, test_response_lists = read_images_policies_responses_paths(test_json_path)
-    train_dataset = PolicyImageDataset(tarin_image_paths, train_policy_lists, train_response_lists, image_size=256)
-    test_dataset = PolicyImageDataset(test_image_paths, test_policy_lists, test_response_lists, image_size=256)
-
+    from transformers.utils import logging
+    logging.set_verbosity_error()
+    from load_models_processors import load_model_and_processor
+    _, _, processor = load_model_and_processor(
+        teacher_path="E:\models\LlavaGuard-v1.2-0.5B-OV-hf",
+        student_path="E:\models\llava-onevision-qwen2-0.5b-ov-hf",
+    )
+    train_dataloader = create_dataloader(train_json_path, processor=processor, batch_size=16)
 
 
