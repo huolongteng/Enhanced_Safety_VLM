@@ -1,22 +1,27 @@
-"""Utilities for loading the teacher/student models and shared processor."""
+"""Utilities for loading a fine-tuning model and its processor."""
 
 from __future__ import annotations
+
+from typing import Optional
 
 from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 __all__ = ["load_model_and_processor"]
 
 
-def load_model_and_processor(teacher_path: str, student_path: str):
-    """Load teacher and student checkpoints alongside a shared processor."""
+def load_model_and_processor(
+    model_path: str,
+    *,
+    processor_path: Optional[str] = None,
+):
+    """Load a single model together with the corresponding processor."""
 
-    teacher_model = LlavaOnevisionForConditionalGeneration.from_pretrained(teacher_path)
-    student_model = LlavaOnevisionForConditionalGeneration.from_pretrained(student_path)
-    processor = AutoProcessor.from_pretrained(teacher_path)
+    model = LlavaOnevisionForConditionalGeneration.from_pretrained(model_path)
+    processor_source = processor_path or model_path
+    processor = AutoProcessor.from_pretrained(processor_source)
 
     # Ensure the sliding-window configuration is disabled to mirror the
     # behaviour relied upon in the legacy training scripts.
-    teacher_model.config.sliding_window = False
-    student_model.config.sliding_window = False
+    model.config.sliding_window = False
 
-    return teacher_model, student_model, processor
+    return model, processor
