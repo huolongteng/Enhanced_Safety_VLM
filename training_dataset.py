@@ -240,12 +240,7 @@ if __name__ == "__main__":
     test_image_dir_prefix = "data/test/"
     train_json_path = "data/train_dataset.json"
     test_json_path = "data/test_dataset.json"
-    # rewrite_image_paths(train_json_path, train_image_dir_prefix)
-    # rewrite_image_paths(test_json_path, test_image_dir_prefix)
-    tarin_image_paths, train_policy_lists, train_response_lists = read_images_policies_responses_paths(train_json_path)
-    test_image_paths, test_policy_lists, test_response_lists = read_images_policies_responses_paths(test_json_path)
-    train_dataset = PolicyImageDataset(tarin_image_paths, train_policy_lists, train_response_lists, image_size=256)
-    test_dataset = PolicyImageDataset(test_image_paths, test_policy_lists, test_response_lists, image_size=256)
+
 
 
 
