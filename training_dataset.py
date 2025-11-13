@@ -134,7 +134,7 @@ def create_dataloader(
     batch_size=1,
     shuffle=False,
     image_size=256,
-    add_generation_prompt=False,
+    add_generation_prompt=True,
     padding=False,
     return_tensors="pt",
     num_workers=0,
@@ -241,6 +241,19 @@ if __name__ == "__main__":
     train_json_path = "data/train_dataset.json"
     test_json_path = "data/test_dataset.json"
 
+    from transformers.utils import logging
+    logging.set_verbosity_error()
+    from load_models_processors import load_model_and_processor
+    _, _, processor = load_model_and_processor(
+        teacher_path="E:\models\LlavaGuard-v1.2-0.5B-OV-hf",
+        student_path="E:\models\llava-onevision-qwen2-0.5b-ov-hf",
+    )
+
+    train_dataloader = create_dataloader(
+        train_json_path,
+        processor=processor,  # Replace with actual processor
+        batch_size=4,
+    )
 
 
 
