@@ -1,4 +1,6 @@
 import json
+from typing import List, Optional, Sequence, Union
+
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -9,9 +11,8 @@ class PolicyImageDataset(Dataset):
 
     Each dataset item returns:
     - "image": a transformed PIL Image (RGB) resized to the specified image_size.
-    - "conversation": a list with two messages:
-        1) user message containing the image marker and the policy text.
-        2) assistant message containing the response text.
+    - "policy": the user policy/instruction text paired with the image.
+    - "response": the assistant response text that acts as the supervision label.
 
     Designed for use with PyTorch DataLoader to feed image+text conversational examples
     into multimodal training or evaluation pipelines.
@@ -35,21 +36,8 @@ class PolicyImageDataset(Dataset):
         response = self.response_lists[idx]
         return {
             "image": image,
-            "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": policy},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": response},
-                    ],
-                },
-            ],
+            "policy": policy,
+            "response": response,
         }
 
 
@@ -60,7 +48,7 @@ def read_images_policies_responses_paths(json_path):
     The JSON file is expected to contain a list of objects, each with:
     - 'input.image': path to the image file
     - 'input.policy': policy text
-    - 'output.response': response text
+    - 'output': response text (stored as a JSON-formatted string)
 
     Returns three lists: image paths, policy texts, and response texts.
     """
@@ -71,19 +59,32 @@ def read_images_policies_responses_paths(json_path):
     policy_texts = []
     response_texts = []
     for obj in data:
-        image_path = (obj.get("input") or {}).get("image")
-        policy_text = (obj.get("input") or {}).get("policy")
-        if isinstance(image_path, str) and image_path.strip():
-            image_paths.append(image_path)
-        if isinstance(policy_text, str) and policy_text.strip():
-            policy_texts.append(policy_text)
-        response_text = (obj.get("output") or {})
-        if isinstance(response_text, str) and response_text.strip():
-            response_texts.append(response_text)
+        input_payload = obj.get("input") or {}
+        response_payload = obj.get("output")
+
+        image_path = input_payload.get("image")
+        policy_text = input_payload.get("policy")
+        if not (
+            isinstance(image_path, str)
+            and image_path.strip()
+            and isinstance(policy_text, str)
+            and policy_text.strip()
+            and isinstance(response_payload, str)
+            and response_payload.strip()
+        ):
+            continue
+
+        image_paths.append(image_path)
+        policy_texts.append(policy_text)
+        response_texts.append(response_payload)
 
     return image_paths, policy_texts, response_texts
 
-def apply_chat_template_to_batch(conversations, processor, add_generation_prompt=False):
+def apply_chat_template_to_batch(
+    conversations,
+    processor,
+    add_generation_prompt=False,
+):
     """Apply the chat template to a batch of conversations."""
     prompts = []
     for conv in conversations:
@@ -96,34 +97,80 @@ def apply_chat_template_to_batch(conversations, processor, add_generation_prompt
     return prompts
 
 def build_policy_collate_fn(
-        processor,
-        add_generation_prompt=False,
-        padding=False,
-        return_tensors="pt",
-        **processor_kwargs
+    processor,
+    add_generation_prompt=False,
+    padding=False,
+    return_tensors="pt",
+    **processor_kwargs,
 ):
-    """Create a collate function that batches samples with the processor."""
+    """Create a collate function that batches samples with the processor.
+
+    The returned function assembles policy/response pairs into chat prompts and
+    produces tensors ready for supervised learning. When ``return_tensors`` is
+    ``"pt"`` and ``add_generation_prompt`` is ``False``, a ``labels`` tensor
+    masking the user portion with ``-100`` is attached to the batch encoding so
+    it can be fed directly to ``LlavaOnevisionForConditionalGeneration`` style
+    models.
+    """
 
     def collate_fn(batch):
         if not batch:
             raise ValueError("Received an empty batch.")
 
         images = [sample["image"] for sample in batch]
-        conversations = [sample["conversation"] for sample in batch]
-        prompts = apply_chat_template_to_batch(
-            conversations,
-            processor,
-            add_generation_prompt=add_generation_prompt,
-        )
+        policies = [sample["policy"] for sample in batch]
+        responses = [sample["response"] for sample in batch]
+
+        user_messages: List[List[dict]] = []
+        full_conversations: List[List[dict]] = []
+        for policy_text, response_text in zip(policies, responses):
+            user_message = {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": policy_text},
+                ],
+            }
+            assistant_message = {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": response_text},
+                ],
+            }
+            user_messages.append([user_message])
+            full_conversations.append([user_message, assistant_message])
+
+        if add_generation_prompt:
+            text_prompts = apply_chat_template_to_batch(
+                user_messages,
+                processor,
+                add_generation_prompt=True,
+            )
+            generation_prompts: Optional[List[str]] = None
+        else:
+            text_prompts = apply_chat_template_to_batch(
+                full_conversations,
+                processor,
+                add_generation_prompt=False,
+            )
+            generation_prompts = apply_chat_template_to_batch(
+                user_messages,
+                processor,
+                add_generation_prompt=True,
+            )
 
         image_token = getattr(processor, "image_token", "<image>")
         aligned_images = []
-        for sample_image, prompt in zip(images, prompts):
+        for sample_image, prompt in zip(images, text_prompts):
             token_uses = prompt.count(image_token)
-            if token_uses <= 1:
+            if token_uses == 0:
+                raise ValueError(
+                    "Chat template did not emit any image tokens; cannot align images."
+                )
+            if token_uses == 1:
                 aligned_images.append(sample_image)
             else:
-                aligned_images.append([sample_image] * token_uses)
+                aligned_images.append([sample_image.copy() for _ in range(token_uses)])
 
         # Pad tokenized prompts when tensors are requested to avoid shape
         # mismatches caused by variable text lengths across samples.
@@ -131,13 +178,49 @@ def build_policy_collate_fn(
         if return_tensors == "pt" and padding is False:
             effective_padding = "longest"
 
-        return processor(
-            text=prompts,
+        batch_encoding = processor(
+            text=text_prompts,
             images=aligned_images,
             padding=effective_padding,
             return_tensors=return_tensors,
             **processor_kwargs,
         )
+
+        if add_generation_prompt or return_tensors != "pt":
+            return batch_encoding
+
+        if not hasattr(processor, "tokenizer"):
+            raise AttributeError(
+                "Processor must expose a tokenizer to compute supervision labels."
+            )
+
+        labels = batch_encoding["input_ids"].clone()
+        for index, prompt in enumerate(generation_prompts or []):
+            prompt_ids = processor.tokenizer(
+                prompt,
+                add_special_tokens=False,
+            )["input_ids"]
+            prompt_length = min(len(prompt_ids), labels.size(1))
+            labels[index, :prompt_length] = -100
+
+        if "attention_mask" in batch_encoding:
+            attention_mask = batch_encoding["attention_mask"]
+            mask = attention_mask == 0
+            if hasattr(labels, "masked_fill"):
+                labels = labels.masked_fill(mask, -100)
+            else:
+                for row_idx in range(len(attention_mask)):
+                    row_mask = mask[row_idx]
+                    if isinstance(row_mask, (list, tuple)):
+                        iterator = enumerate(row_mask)
+                    else:
+                        iterator = enumerate(getattr(row_mask, "data", row_mask))
+                    for col_idx, should_mask in iterator:
+                        if should_mask:
+                            labels[row_idx, col_idx] = -100
+
+        batch_encoding["labels"] = labels
+        return batch_encoding
 
     return collate_fn
 
@@ -164,7 +247,7 @@ def create_dataloader(
     ----------
     json_path: str or pathlib.Path
         Path to the JSON dataset file containing ``input.image``, ``input.policy``
-        and ``output.response`` entries.
+        and ``output`` entries.
     processor: callable
         Processor (typically a HuggingFace processor) used to collate samples into
         tensors. It must expose an ``apply_chat_template`` method.
@@ -188,6 +271,9 @@ def create_dataloader(
     -------
     DataLoader
         A PyTorch dataloader yielding batches of processed multimodal examples.
+        When ``return_tensors`` is ``"pt"`` and ``add_generation_prompt`` is
+        ``False`` the batches also include ``labels`` tensors with the user
+        prompt masked to ``-100`` for supervised learning.
     """
 
     image_paths, policy_texts, response_texts = read_images_policies_responses_paths(json_path)
@@ -248,32 +334,5 @@ def rewrite_image_paths(json_path, image_dir_prefix):
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
-
-
-if __name__ == "__main__":
-    train_image_dir_prefix = "data/train/"
-    test_image_dir_prefix = "data/test/"
-    train_json_path = "data/train_dataset.json"
-    test_json_path = "data/test_dataset.json"
-
-    from transformers.utils import logging
-    logging.set_verbosity_error()
-    from load_models_processors import load_model_and_processor
-    _, _, processor = load_model_and_processor(
-        teacher_path="E:\models\LlavaGuard-v1.2-0.5B-OV-hf",
-        student_path="E:\models\llava-onevision-qwen2-0.5b-ov-hf",
-    )
-
-    train_dataloader = create_dataloader(
-        train_json_path,
-        processor=processor,  # Replace with actual processor
-        batch_size=1,
-        padding=False,
-        image_size=256,
-        add_generation_prompt=False,
-    )
-    batch = next(iter(train_dataloader))
-
-
 
 
