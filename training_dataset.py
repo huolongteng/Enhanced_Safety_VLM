@@ -267,8 +267,13 @@ if __name__ == "__main__":
     train_dataloader = create_dataloader(
         train_json_path,
         processor=processor,  # Replace with actual processor
-        batch_size=64,
+        batch_size=1,
+        padding=False,
+        image_size=256,
+        add_generation_prompt=False,
     )
+    batch = next(iter(train_dataloader))
+
 
 
 
