@@ -4,6 +4,7 @@ import random
 
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from transformers.utils import logging
 
@@ -26,7 +27,7 @@ TRAIN_JSON_PATH = "data/train_dataset.json"
 TEST_JSON_PATH = "data/test_dataset.json"
 LEARNING_RATE = 1e-4
 IMAGE_SIZE = 256
-OUTPUT_DIR = Path("outputs-1141")
+OUTPUT_DIR = Path("outputs-1117")
 SEED = 2025
 GRADIENT_ACCUMULATION_STEPS = 32
 ENABLE_EARLY_STOPPING = True
@@ -37,10 +38,13 @@ EARLY_STOPPING_RESTORE_BEST = True
 VALIDATION_SPLIT_RATIO = 0.15
 LOSS_FIGURE_PATH = OUTPUT_DIR / "training_loss_curve.png"
 BEST_STATE_PATH = OUTPUT_DIR / "best_model_state.pt"
+SOFT_LABEL_WEIGHT = 0.8
+HARD_LABEL_WEIGHT = 0.2
+KD_TEMPERATURE = 1.0
 
 
-# step-1: load the student model and shared processor (teacher is not needed afterward)
-_, student_model, processor = load_model_and_processor(TEACHER_MODEL_PATH, STUDENT_MODEL_PATH)
+# step-1: load both teacher/student models and share the processor for distillation
+teacher_model, student_model, processor = load_model_and_processor(TEACHER_MODEL_PATH, STUDENT_MODEL_PATH)
 
 
 # step-2: make training deterministic for reproducibility
@@ -115,6 +119,10 @@ test_dataloader = create_dataloader(
 # step-7: select device and disable caching for training stability
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 student_model.to(DEVICE)
+teacher_model.to(DEVICE)
+teacher_model.eval()
+for param in teacher_model.parameters():
+    param.requires_grad = False
 
 
 # step-8: freeze every parameter except the student llm block
@@ -178,6 +186,28 @@ def move_batch_to_device(batch, device):
     return updated
 
 
+def compute_kd_loss(student_logits, teacher_logits, attention_mask, temperature=1.0):
+    """Compute token-level KL divergence distillation loss with optional masking."""
+
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+    student_log_probs = student_log_probs.view(-1, student_log_probs.size(-1))
+    teacher_probs = teacher_probs.view(-1, teacher_probs.size(-1))
+
+    if attention_mask is not None:
+        flat_mask = attention_mask.view(-1).bool()
+        if flat_mask.any():
+            student_log_probs = student_log_probs[flat_mask]
+            teacher_probs = teacher_probs[flat_mask]
+        else:
+            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
+
+    kd = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
+    return kd * (temperature**2)
+
+
 def evaluate_dataloader(dataloader):
     student_model.eval()
     total_loss = 0.0
@@ -201,8 +231,40 @@ for epoch_index in range(NUM_EPOCHS):
     micro_step_counter = 0
     for batch in train_dataloader:
         batch = move_batch_to_device(batch, DEVICE)
-        outputs = student_model(**batch)
-        loss = outputs.loss
+        # Run teacher forward pass only for logits to build soft labels without gradients
+        with torch.no_grad():
+            teacher_inputs = {k: v for k, v in batch.items() if k != "labels"}
+            teacher_outputs = teacher_model(
+                **teacher_inputs,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+            teacher_logits = teacher_outputs.logits.detach()
+
+        # Student computes hard-label cross-entropy and soft-label KL divergence
+        student_outputs = student_model(
+            **batch,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+        student_logits = student_outputs.logits
+        hard_loss = student_outputs.loss
+
+        # Align logits and masks for causal LM (predict token t+1) and compute distillation
+        shifted_student_logits = student_logits[:, :-1, :]
+        shifted_teacher_logits = teacher_logits[:, :-1, :]
+        attention_mask = batch.get("attention_mask")
+        shifted_attention = attention_mask[:, 1:] if attention_mask is not None else None
+        label_mask = (batch["labels"][:, 1:] != -100)
+        combined_mask = label_mask if shifted_attention is None else (shifted_attention.bool() & label_mask)
+        soft_loss = compute_kd_loss(
+            shifted_student_logits,
+            shifted_teacher_logits,
+            combined_mask,
+            temperature=KD_TEMPERATURE,
+        )
+
+        loss = SOFT_LABEL_WEIGHT * soft_loss + HARD_LABEL_WEIGHT * hard_loss
         (loss / GRADIENT_ACCUMULATION_STEPS).backward()
         accumulated_loss += float(loss.detach().cpu())
         micro_step_counter += 1
