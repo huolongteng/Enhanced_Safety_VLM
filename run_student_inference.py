@@ -18,7 +18,7 @@ STATE_DICT_PATH = "outputs-1141/model.safetensors"          # path to the fine-t
 TEST_DIR = "data/test"                                      # folder containing test JPG images
 POLICY_PATH = "policy.json"                                 # JSON file with a 'policies' list
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"  # computation device
-SEED = 1234                                                   # random seed for sampling an image
+SEED = 5388797                                                   # random seed for sampling an image
 MAX_NEW_TOKENS = 512
 TEST_DATASET_PATH = 'data/test_dataset.json'# generation length
 

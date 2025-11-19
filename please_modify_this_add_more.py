@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from transformers.utils import logging
+from tqdm.auto import tqdm
 
 from load_models_processors import load_model_and_processor
 from training_dataset import (
@@ -15,6 +16,7 @@ from training_dataset import (
     create_dataloader,
     read_images_policies_responses_paths,
 )
+from peft import LoraConfig, get_peft_model
 
 logging.set_verbosity_error()
 
@@ -25,29 +27,40 @@ NUM_EPOCHS = 20
 BATCH_SIZE = 1
 TRAIN_JSON_PATH = "data/train_dataset.json"
 TEST_JSON_PATH = "data/test_dataset.json"
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 IMAGE_SIZE = 256
-OUTPUT_DIR = Path("outputs-1117")
-SEED = 2025
-GRADIENT_ACCUMULATION_STEPS = 32
+OUTPUT_DIR = Path("outputs-1118")
+SEED = 4903996
+GRADIENT_ACCUMULATION_STEPS = 24
 ENABLE_EARLY_STOPPING = True
 EARLY_STOPPING_PATIENCE = 2
 EARLY_STOPPING_MIN_DELTA = 0.0
 EARLY_STOPPING_MIN_EPOCHS = 1
 EARLY_STOPPING_RESTORE_BEST = True
-VALIDATION_SPLIT_RATIO = 0.15
+VALIDATION_SPLIT_RATIO = 0.3
 LOSS_FIGURE_PATH = OUTPUT_DIR / "training_loss_curve.png"
 BEST_STATE_PATH = OUTPUT_DIR / "best_model_state.pt"
-SOFT_LABEL_WEIGHT = 0.8
-HARD_LABEL_WEIGHT = 0.2
-KD_TEMPERATURE = 1.0
+SOFT_LABEL_WEIGHT = 0.2
+HARD_LABEL_WEIGHT = 0.8
+KD_TEMPERATURE = 2.0
 
 
 # step-1: load both teacher/student models and share the processor for distillation
 teacher_model, student_model, processor = load_model_and_processor(TEACHER_MODEL_PATH, STUDENT_MODEL_PATH)
 
 
-# step-2: make training deterministic for reproducibility
+# step-2: configure a high-capacity LoRA setup early to accelerate language adapter training
+lora_config = LoraConfig(
+    r=32,
+    lora_alpha=64,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+)
+
+
+# step-3: make training deterministic for reproducibility
 def seed_everything(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -61,13 +74,14 @@ def seed_everything(seed):
 seed_everything(SEED)
 
 
-# step-3: prepare output directory for checkpoints and plots
+# step-4: prepare output directory for checkpoints and plots
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# step-4: read the full training dataset and create a validation split
+# step-5: read the full training dataset and create a validation split
 train_image_paths, train_policies, train_responses = read_images_policies_responses_paths(TRAIN_JSON_PATH)
 full_training_dataset = PolicyImageDataset(train_image_paths, train_policies, train_responses, image_size=IMAGE_SIZE)
+
 
 if len(full_training_dataset) < 2:
     raise ValueError("Need at least two samples to form train/validation sets.")
@@ -82,7 +96,7 @@ train_subset, val_subset = random_split(
 )
 
 
-# step-5: build the collate function shared across train/val loaders
+# step-6: build the collate function shared across train/val loaders
 train_collate_fn = build_policy_collate_fn(
     processor,
     add_generation_prompt=False,
@@ -91,7 +105,7 @@ train_collate_fn = build_policy_collate_fn(
 )
 
 
-# step-6: instantiate the train, validation, and test dataloaders
+# step-7: instantiate the train, validation, and test dataloaders
 train_dataloader = DataLoader(
     train_subset,
     batch_size=BATCH_SIZE,
@@ -116,7 +130,7 @@ test_dataloader = create_dataloader(
 )
 
 
-# step-7: select device and disable caching for training stability
+# step-8: select device and disable caching for training stability
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 student_model.to(DEVICE)
 teacher_model.to(DEVICE)
@@ -125,7 +139,11 @@ for param in teacher_model.parameters():
     param.requires_grad = False
 
 
-# step-8: freeze every parameter except the student llm block
+# step-9: attach LoRA adapters to the student language model
+student_model = get_peft_model(student_model, lora_config)
+
+
+# step-10: freeze every visual encoder and projector parameter of the student using the shared helper
 def freeze_student_vision_and_projector(student_model):
     frozen_components = []
     candidate_attrs = (
@@ -156,18 +174,16 @@ def freeze_student_vision_and_projector(student_model):
     return frozen_components
 
 
-
 frozen_visual_components = freeze_student_vision_and_projector(student_model)
 
 
-
-# step-9: configure optimizer only for trainable parameters
+# step-11: configure optimizer only for LoRA and other trainable parameters
 TRAINABLE_PARAMETERS = [p for p in student_model.parameters() if p.requires_grad]
 
 optimizer = torch.optim.AdamW(TRAINABLE_PARAMETERS, lr=LEARNING_RATE)
 
 
-# step-10: containers for tracking metrics and early stopping
+# step-12: containers for tracking metrics and early stopping
 GLOBAL_STEP = 0
 TRAINING_STEP_LOSSES = []
 EPOCH_VALIDATION_LOSSES = []
@@ -224,12 +240,13 @@ def evaluate_dataloader(dataloader):
     return total_loss / total_batches
 
 
-# step-11: run the supervised fine-tuning loop with gradient accumulation and early stopping
+# step-12: run the supervised fine-tuning loop with gradient accumulation, a progress bar, and early stopping
 for epoch_index in range(NUM_EPOCHS):
     student_model.train()
     accumulated_loss = 0.0
     micro_step_counter = 0
-    for batch in train_dataloader:
+    progress_bar = tqdm(train_dataloader, desc=f"epoch {epoch_index + 1}/{NUM_EPOCHS}", leave=False)
+    for batch in progress_bar:
         batch = move_batch_to_device(batch, DEVICE)
         # Run teacher forward pass only for logits to build soft labels without gradients
         with torch.no_grad():
@@ -277,6 +294,7 @@ for epoch_index in range(NUM_EPOCHS):
             TRAINING_STEP_LOSSES.append((GLOBAL_STEP, average_loss))
             accumulated_loss = 0.0
             micro_step_counter = 0
+            progress_bar.set_postfix({"step_loss": f"{average_loss:.4f}"})
 
     if micro_step_counter > 0:
         optimizer.step()
@@ -304,16 +322,16 @@ for epoch_index in range(NUM_EPOCHS):
             break
 
 
-# step-12: restore the best validation checkpoint if requested
+# step-13: restore the best validation checkpoint if requested
 if EARLY_STOPPING_RESTORE_BEST and BEST_STATE_PATH.exists():
     student_model.load_state_dict(torch.load(BEST_STATE_PATH, map_location=DEVICE))
 
 
-# step-13: persist the fine-tuned student model to the configured output directory
+# step-14: persist the fine-tuned student model to the configured output directory
 student_model.save_pretrained(OUTPUT_DIR)
 
 
-# step-14: draw the loss curve sampled every five optimizer steps
+# step-15: draw the loss curve sampled every five optimizer steps
 if TRAINING_STEP_LOSSES:
     recorded_steps = [item[0] for item in TRAINING_STEP_LOSSES]
     recorded_losses = [item[1] for item in TRAINING_STEP_LOSSES]
