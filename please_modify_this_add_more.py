@@ -30,14 +30,14 @@ TEST_JSON_PATH = "data/test_dataset.json"
 LEARNING_RATE = 5e-5
 IMAGE_SIZE = 256
 OUTPUT_DIR = Path("outputs-1118")
-SEED = 4903996
+SEED = 42987
 GRADIENT_ACCUMULATION_STEPS = 24
 ENABLE_EARLY_STOPPING = True
 EARLY_STOPPING_PATIENCE = 2
 EARLY_STOPPING_MIN_DELTA = 0.0
 EARLY_STOPPING_MIN_EPOCHS = 1
 EARLY_STOPPING_RESTORE_BEST = True
-VALIDATION_SPLIT_RATIO = 0.3
+VALIDATION_SPLIT_RATIO = 0.2
 LOSS_FIGURE_PATH = OUTPUT_DIR / "training_loss_curve.png"
 BEST_STATE_PATH = OUTPUT_DIR / "best_model_state.pt"
 SOFT_LABEL_WEIGHT = 0.2
@@ -51,13 +51,14 @@ teacher_model, student_model, processor = load_model_and_processor(TEACHER_MODEL
 
 # step-2: configure a high-capacity LoRA setup early to accelerate language adapter training
 lora_config = LoraConfig(
-    r=32,
-    lora_alpha=64,
+    r=8,
+    lora_alpha=16,
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    target_modules=["q_proj", "v_proj", "up_proj", "down_proj"],
 )
+# "k_proj",  "o_proj", "gate_proj" were removed from target_modules.
 
 
 # step-3: make training deterministic for reproducibility
