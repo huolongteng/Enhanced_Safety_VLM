@@ -13,25 +13,15 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoProcessor, LlavaOnevisionForConditionalGeneration
-from transformers.utils import logging
+from transformers import Qwen2_5_VLForConditionalGeneration
+from qwen_vl_utils import process_vision_info
 
+from transformers.utils import logging
 logging.set_verbosity_error()
 
-MODEL_ROLE = "STUDENT"  # toggle between "STUDENT" and "TEACHER" for different checkpoints
-
-if MODEL_ROLE == "STUDENT":
-    MODEL_BASE = r"E:\\models\\llava-onevision-qwen2-0.5b-ov-hf"   # base student checkpoint
-    STATE_DICT_PATH = "outputs-1141/model.safetensors"               # fine-tuned weights (set to None if unused)
-    APPLY_LORA = True                                                 # student uses LoRA adapters
-elif MODEL_ROLE == "TEACHER":
-    MODEL_BASE = r"E:\\models\\LlavaGuard-v1.2-0.5B-OV-hf"        # teacher checkpoint (no LoRA)
-    STATE_DICT_PATH = None                                            # teacher runs as-is
-    APPLY_LORA = False
-else:
-    raise ValueError("MODEL_ROLE must be either 'STUDENT' or 'TEACHER'.")
-
+MODEL_BASE = "E:\models\QwenGuard-v1.2-3B"
 TEST_DATASET_PATH = Path("data/test_dataset.json")                # dataset with id/input/output fields
-OUTPUT_JSON_PATH = Path("data/model_outputs/model_outputs.json")  # where to save model predictions
+OUTPUT_JSON_PATH = Path("data/model_outputs/7B_model_outputs.json")  # where to save model predictions
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_NEW_TOKENS = 512                                              # generation length
 TEMPERATURE = 1.0
@@ -54,17 +44,8 @@ print(f"Loaded {len(test_entries)} test entries from {TEST_DATASET_PATH}.")
 # step-2: initialize processor and model, then optionally load fine-tuned weights
 processor = AutoProcessor.from_pretrained(MODEL_BASE)
 config = AutoConfig.from_pretrained(MODEL_BASE)
-model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
-
-if STATE_DICT_PATH and Path(STATE_DICT_PATH).exists():
-    print(f"Loading fine-tuned weights from {STATE_DICT_PATH}...")
-    if str(STATE_DICT_PATH).endswith(".safetensors"):
-        state_dict = load_file(STATE_DICT_PATH)
-    else:
-        state_dict = torch.load(STATE_DICT_PATH, map_location="cpu")
-    model.load_state_dict(state_dict, strict=True)
-else:
-    print("STATE_DICT_PATH not provided or file missing; using base model weights only.")
+# model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
 
 model.to(DEVICE)
 model.eval()

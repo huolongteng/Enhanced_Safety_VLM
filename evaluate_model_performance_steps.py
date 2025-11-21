@@ -9,12 +9,13 @@ definitions so each step can be read and modified directly.
 # student or teacher model's JSON output before running the script.
 import csv
 import json
+import re
 from pathlib import Path
 
 from sklearn.metrics import accuracy_score, fbeta_score, precision_recall_fscore_support
 
 TEST_CSV_PATH = Path("data/test.csv")
-MODEL_OUTPUT_PATH = Path("data/model_outputs/teacher_model_outputs.json")  # replace with your model's output path
+MODEL_OUTPUT_PATH = Path("data/model_outputs/student_model_outputs.json")  # replace with your model's output path
 
 
 # step-2: load the labeled test dataset from ``data/test.csv`` and extract the
@@ -43,41 +44,64 @@ with MODEL_OUTPUT_PATH.open("r", encoding="utf-8") as prediction_file:
 
 
 def _extract_rating_and_category(raw_text: str):
-    """Parse rating/category JSON that appears after the "assistant" keyword."""
+    """Parse rating/category after "assistant" using tolerant fallbacks."""
 
     if not isinstance(raw_text, str):
         return None
 
-    lower_bound = raw_text.find("assistant")
+    lower_text = raw_text.lower()
+    lower_bound = lower_text.find("assistant")
     if lower_bound == -1:
         return None
 
     assistant_tail = raw_text[lower_bound + len("assistant") :]
-    start = assistant_tail.find("{")
-    if start == -1:
-        return None
 
-    depth = 0
-    end = None
-    for idx, char in enumerate(assistant_tail[start:], start=start):
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                end = idx
-                break
+    def _balanced_block(text: str):
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        end = None
+        for idx, char in enumerate(text[start:], start=start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx
+                    break
+        if end is None:
+            return None
+        return text[start : end + 1]
 
-    if end is None:
-        return None
+    def _load_json_snippet(snippet: str):
+        cleaned = re.sub(r",(\s*[}\]])", r"\1", snippet)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
 
-    try:
-        parsed = json.loads(assistant_tail[start : end + 1])
-    except json.JSONDecodeError:
-        return None
+    candidate = _balanced_block(assistant_tail)
+    parsed = _load_json_snippet(candidate) if candidate else None
 
-    rating = str(parsed.get("rating", "")).strip().lower()
-    category = str(parsed.get("category", "")).strip().lower()
+    if parsed is None:
+        match = re.search(r"\{[^{}]*\brating\b[^{}]*\bcategory\b[^{}]*\}", assistant_tail, re.IGNORECASE | re.DOTALL)
+        if match:
+            parsed = _load_json_snippet(match.group(0))
+
+    rating = category = None
+    if parsed is None:
+        rating_match = re.search(r'"rating"\s*:\s*"([^"]+)"', assistant_tail, re.IGNORECASE | re.DOTALL)
+        category_match = re.search(r'"category"\s*:\s*"([^"]+)"', assistant_tail, re.IGNORECASE | re.DOTALL)
+        if rating_match and category_match:
+            rating = rating_match.group(1)
+            category = category_match.group(1)
+    else:
+        rating = parsed.get("rating")
+        category = parsed.get("category")
+
+    rating = str(rating or "").strip().lower()
+    category = str(category or "").strip().lower()
     if rating and category:
         return rating, category
 
