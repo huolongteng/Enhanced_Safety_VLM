@@ -11,14 +11,26 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from safetensors.torch import load_file
 from transformers import AutoConfig, AutoProcessor, LlavaOnevisionForConditionalGeneration
 from transformers.utils import logging
 from peft import LoraConfig, get_peft_model
 
 logging.set_verbosity_error()
 
-MODEL_BASE = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"         # base model checkpoint
-STATE_DICT_PATH = "outputs-1118/best_model_state.pt"             # fine-tuned weights (set to None if unused)
+MODEL_ROLE = "STUDENT"  # toggle between "STUDENT" and "TEACHER" for different checkpoints
+
+if MODEL_ROLE == "STUDENT":
+    MODEL_BASE = r"E:\\models\\llava-onevision-qwen2-0.5b-ov-hf"   # base student checkpoint
+    STATE_DICT_PATH = "outputs-1141/model.safetensors"               # fine-tuned weights (set to None if unused)
+    APPLY_LORA = True                                                 # student uses LoRA adapters
+elif MODEL_ROLE == "TEACHER":
+    MODEL_BASE = r"E:\\models\\LlavaGuard-v1.2-0.5B-OV-hf"        # teacher checkpoint (no LoRA)
+    STATE_DICT_PATH = None                                            # teacher runs as-is
+    APPLY_LORA = False
+else:
+    raise ValueError("MODEL_ROLE must be either 'STUDENT' or 'TEACHER'.")
+
 TEST_DATASET_PATH = Path("data/test_dataset.json")                # dataset with id/input/output fields
 OUTPUT_JSON_PATH = Path("data/model_outputs/model_outputs.json")  # where to save model predictions
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,19 +57,26 @@ print(f"Loaded {len(test_entries)} test entries from {TEST_DATASET_PATH}.")
 processor = AutoProcessor.from_pretrained(MODEL_BASE)
 config = AutoConfig.from_pretrained(MODEL_BASE)
 base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=LORA_TARGET_MODULES,
-)
-model = get_peft_model(base_model, lora_config)
+
+if APPLY_LORA:
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=LORA_TARGET_MODULES,
+    )
+    model = get_peft_model(base_model, lora_config)
+else:
+    model = base_model
 
 if STATE_DICT_PATH and Path(STATE_DICT_PATH).exists():
     print(f"Loading fine-tuned weights from {STATE_DICT_PATH}...")
-    state_dict = torch.load(STATE_DICT_PATH, map_location="cpu")
+    if str(STATE_DICT_PATH).endswith(".safetensors"):
+        state_dict = load_file(STATE_DICT_PATH)
+    else:
+        state_dict = torch.load(STATE_DICT_PATH, map_location="cpu")
     model.load_state_dict(state_dict, strict=True)
 else:
     print("STATE_DICT_PATH not provided or file missing; using base model weights only.")
