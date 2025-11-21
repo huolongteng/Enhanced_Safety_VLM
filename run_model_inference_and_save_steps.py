@@ -11,9 +11,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from safetensors.torch import load_file
-from transformers import AutoConfig, AutoProcessor, LlavaOnevisionForConditionalGeneration
-from transformers import Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 from transformers.utils import logging
@@ -43,11 +41,9 @@ print(f"Loaded {len(test_entries)} test entries from {TEST_DATASET_PATH}.")
 
 # step-2: initialize processor and model, then optionally load fine-tuned weights
 processor = AutoProcessor.from_pretrained(MODEL_BASE)
-config = AutoConfig.from_pretrained(MODEL_BASE)
-# model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
-
-model.to(DEVICE)
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    MODEL_BASE, torch_dtype="auto", device_map="auto"
+)
 model.eval()
 
 # step-3: set up generation configuration shared across all samples
@@ -77,24 +73,40 @@ for sample in test_entries:
         print(f"Skipping sample {sample_id}: missing policy or image path.")
         continue
 
-    conversation = [
+    image = Image.open(Path(image_path)).convert("RGB")
+    messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image"},
+                {"type": "image", "image": image},
                 {"type": "text", "text": policy_text},
             ],
         }
     ]
-    prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
 
-    image = Image.open(Path(image_path)).convert("RGB")
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to(DEVICE)
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(DEVICE)
 
     with torch.no_grad():
-        generated = model.generate(**inputs, **common_generation_kwargs)
+        generated_ids = model.generate(**inputs, **common_generation_kwargs)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
 
-    decoded = processor.decode(generated[0], skip_special_tokens=True)
+    decoded_list = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    decoded = decoded_list[0] if decoded_list else ""
 
     # attempt to normalize JSON-like responses so the evaluation script can parse them
     normalized_output = decoded
