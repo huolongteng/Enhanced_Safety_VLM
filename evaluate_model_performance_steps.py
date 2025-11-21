@@ -11,8 +11,10 @@ import csv
 import json
 from pathlib import Path
 
+from sklearn.metrics import accuracy_score, fbeta_score, precision_recall_fscore_support
+
 TEST_CSV_PATH = Path("data/test.csv")
-MODEL_OUTPUT_PATH = Path("data/model_outputs/student_model_outputs.json")  # replace with your model's output path
+MODEL_OUTPUT_PATH = Path("data/model_outputs/teacher_model_outputs.json")  # replace with your model's output path
 
 
 # step-2: load the labeled test dataset from ``data/test.csv`` and extract the
@@ -40,31 +42,24 @@ with MODEL_OUTPUT_PATH.open("r", encoding="utf-8") as prediction_file:
     prediction_entries = json.load(prediction_file)
 
 
-def _extract_assistant_json(raw_prediction: str):
-    """Return the assistant portion of a conversation-style prediction string.
+def _extract_rating_and_category(raw_text: str):
+    """Parse rating/category JSON that appears after the "assistant" keyword."""
 
-    Saved outputs contain a user prompt followed by the assistant reply. The
-    reply always includes a JSON object (``{...}``), so we extract the first
-    balanced block starting from the initial ``{`` to ensure we parse the
-    model's structured output even if other text follows. If the extraction
-    fails, an empty dictionary is returned.
-    """
+    if not isinstance(raw_text, str):
+        return None
 
-    assistant_segment = raw_prediction
-    if "assistant" in raw_prediction:
-        assistant_segment = raw_prediction.split("assistant", 1)[1]
+    lower_bound = raw_text.find("assistant")
+    if lower_bound == -1:
+        return None
 
-    start = assistant_segment.find("{")
+    assistant_tail = raw_text[lower_bound + len("assistant") :]
+    start = assistant_tail.find("{")
     if start == -1:
-        try:
-            return json.loads(raw_prediction)
-        except json.JSONDecodeError:
-            return {}
+        return None
 
     depth = 0
     end = None
-    for idx in range(start, len(assistant_segment)):
-        char = assistant_segment[idx]
+    for idx, char in enumerate(assistant_tail[start:], start=start):
         if char == "{":
             depth += 1
         elif char == "}":
@@ -73,138 +68,88 @@ def _extract_assistant_json(raw_prediction: str):
                 end = idx
                 break
 
-    if end is not None:
-        try:
-            return json.loads(assistant_segment[start : end + 1])
-        except json.JSONDecodeError:
-            pass
+    if end is None:
+        return None
 
     try:
-        return json.loads(raw_prediction)
+        parsed = json.loads(assistant_tail[start : end + 1])
     except json.JSONDecodeError:
-        return {}
+        return None
+
+    rating = str(parsed.get("rating", "")).strip().lower()
+    category = str(parsed.get("category", "")).strip().lower()
+    if rating and category:
+        return rating, category
+
+    return None
 
 
 pred_by_id = {}
-rating_distribution = {}
-category_distribution = {}
-rating_members = {}
-category_members = {}
 for record in prediction_entries:
     raw_prediction = record.get("output") or record.get("model_output", {})
-    if isinstance(raw_prediction, str):
-        parsed_prediction = _extract_assistant_json(raw_prediction)
+    parsed_prediction = _extract_rating_and_category(raw_prediction)
+    if parsed_prediction is None:
+        pred_by_id[record.get("id")] = None
     else:
-        parsed_prediction = raw_prediction
-
-    rating_prediction = str(parsed_prediction.get("rating", "")).strip().lower()
-    category_prediction = str(parsed_prediction.get("category", "")).strip().lower()
-    pred_by_id[record.get("id")] = {
-        "label": (rating_prediction, category_prediction),
-        "raw": parsed_prediction,
-    }
-
-    if rating_prediction:
-        rating_distribution[rating_prediction] = rating_distribution.get(
-            rating_prediction, 0
-        ) + 1
-        rating_members.setdefault(rating_prediction, []).append(record.get("id"))
-
-    if category_prediction:
-        category_distribution[category_prediction] = category_distribution.get(
-            category_prediction, 0
-        ) + 1
-        category_members.setdefault(category_prediction, []).append(record.get("id"))
+        rating_prediction, category_prediction = parsed_prediction
+        pred_by_id[record.get("id")] = {
+            "label": (rating_prediction, category_prediction),
+            "raw": {"rating": rating_prediction, "category": category_prediction},
+        }
 
 
 # step-4: align predictions with ground-truth labels by ``id`` and accumulate
 # counts needed for accuracy, precision, recall, F1, and F2 calculations.
-correct_predictions = 0
 considered_examples = 0
 missing_predictions = []
-per_label_counts = {}
-
-rating_correct = 0
-category_correct = 0
-
-total_true_positives = 0
-total_false_positives = 0
-total_false_negatives = 0
+y_true_rating = []
+y_pred_rating = []
+y_true_category = []
+y_pred_category = []
 
 for sample_id, truth in truth_by_id.items():
     prediction = pred_by_id.get(sample_id)
-    if prediction is None:
+    if not prediction:
+        missing_predictions.append(sample_id)
+        continue
+
+    truth_rating, truth_category = truth["label"]
+    predicted_rating, predicted_category = prediction["label"]
+
+    if not (truth_rating and truth_category and predicted_rating and predicted_category):
         missing_predictions.append(sample_id)
         continue
 
     considered_examples += 1
-    truth_label = truth["label"]
-    predicted_label = prediction["label"]
-
-    if truth_label[0] == predicted_label[0]:
-        rating_correct += 1
-    if truth_label[1] == predicted_label[1]:
-        category_correct += 1
-
-    for label in (truth_label, predicted_label):
-        if label not in per_label_counts:
-            per_label_counts[label] = {"tp": 0, "fp": 0, "fn": 0, "support": 0}
-
-    per_label_counts[truth_label]["support"] += 1
-
-    if predicted_label == truth_label:
-        correct_predictions += 1
-        total_true_positives += 1
-        per_label_counts[truth_label]["tp"] += 1
-    else:
-        total_false_positives += 1
-        total_false_negatives += 1
-        per_label_counts[predicted_label]["fp"] += 1
-        per_label_counts[truth_label]["fn"] += 1
+    y_true_rating.append(truth_rating)
+    y_pred_rating.append(predicted_rating)
+    y_true_category.append(truth_category)
+    y_pred_category.append(predicted_category)
 
 
-# step-5: compute aggregate metrics (micro-averaged over all labels) with
-# safeguards against division by zero.
-accuracy = correct_predictions / considered_examples if considered_examples else 0.0
-precision = (
-    total_true_positives / (total_true_positives + total_false_positives)
-    if (total_true_positives + total_false_positives) > 0
-    else 0.0
-)
-recall = (
-    total_true_positives / (total_true_positives + total_false_negatives)
-    if (total_true_positives + total_false_negatives) > 0
-    else 0.0
-)
+# step-5: compute aggregate metrics per field with macro averaging
+if considered_examples:
+    rating_accuracy = accuracy_score(y_true_rating, y_pred_rating)
+    category_accuracy = accuracy_score(y_true_category, y_pred_category)
 
-# macro-averaged metrics across all observed labels
-macro_precisions = []
-macro_recalls = []
-macro_f1s = []
-for counts in per_label_counts.values():
-    label_precision_den = counts["tp"] + counts["fp"]
-    label_recall_den = counts["tp"] + counts["fn"]
-    label_precision = counts["tp"] / label_precision_den if label_precision_den else 0.0
-    label_recall = counts["tp"] / label_recall_den if label_recall_den else 0.0
-    label_f1_den = label_precision + label_recall
-    label_f1 = (2 * label_precision * label_recall / label_f1_den) if label_f1_den else 0.0
+    rating_precision, rating_recall, rating_f1, _ = precision_recall_fscore_support(
+        y_true_rating, y_pred_rating, average="macro", zero_division=0
+    )
+    category_precision, category_recall, category_f1, _ = precision_recall_fscore_support(
+        y_true_category, y_pred_category, average="macro", zero_division=0
+    )
 
-    # only include labels that were either predicted or present in the truth set
-    if label_precision_den or label_recall_den:
-        macro_precisions.append(label_precision)
-        macro_recalls.append(label_recall)
-        macro_f1s.append(label_f1)
-
-macro_precision = sum(macro_precisions) / len(macro_precisions) if macro_precisions else 0.0
-macro_recall = sum(macro_recalls) / len(macro_recalls) if macro_recalls else 0.0
-macro_f1 = sum(macro_f1s) / len(macro_f1s) if macro_f1s else 0.0
-
-f1_denominator = precision + recall
-f1_score = (2 * precision * recall / f1_denominator) if f1_denominator else 0.0
-
-beta = 2
-f2_denominator = (beta ** 2 * precision) + recall
-f2_score = ((1 + beta ** 2) * precision * recall / f2_denominator) if f2_denominator else 0.0
+    rating_f2 = fbeta_score(
+        y_true_rating, y_pred_rating, beta=2, average="macro", zero_division=0
+    )
+    category_f2 = fbeta_score(
+        y_true_category, y_pred_category, beta=2, average="macro", zero_division=0
+    )
+else:
+    rating_accuracy = rating_precision = rating_recall = rating_f1 = rating_f2 = 0.0
+    category_accuracy = (
+        category_precision
+    ) = category_recall = category_f1 = category_f2 = 0.0
 
 
 # step-6: print the evaluation summary to the terminal, including any ids that
@@ -217,35 +162,16 @@ if missing_predictions:
     for sample_id in missing_predictions:
         print(f" - {sample_id}")
 
-print(f"Accuracy : {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall   : {recall:.4f}")
-print(f"F1 Score : {f1_score:.4f}")
-print(f"F2 Score : {f2_score:.4f}")
-print(f"Macro Precision: {macro_precision:.4f}")
-print(f"Macro Recall   : {macro_recall:.4f}")
-print(f"Macro F1 Score : {macro_f1:.4f}")
-print(
-    f"Rating accuracy: {rating_correct / considered_examples:.4f}" if considered_examples else "Rating accuracy: 0.0000"
-)
-print(
-    f"Category accuracy: {category_correct / considered_examples:.4f}" if considered_examples else "Category accuracy: 0.0000"
-)
+print("\nRating metrics")
+print(f"Accuracy : {rating_accuracy:.4f}")
+print(f"Precision: {rating_precision:.4f}")
+print(f"Recall   : {rating_recall:.4f}")
+print(f"F1 Score : {rating_f1:.4f}")
+print(f"F2 Score : {rating_f2:.4f}")
 
-print("\nPrediction rating distribution (normalized to lowercase):")
-for rating_value, count in sorted(rating_distribution.items()):
-    ids = ", ".join(str(i) for i in rating_members.get(rating_value, []))
-    print(f" - rating='{rating_value}': {count} -> ids: [{ids}]")
-
-print("\nPrediction category distribution (normalized to lowercase):")
-for category_value, count in sorted(category_distribution.items()):
-    ids = ", ".join(str(i) for i in category_members.get(category_value, []))
-    print(f" - category='{category_value}': {count} -> ids: [{ids}]")
-
-print("\nPer-label support and errors (tp/fp/fn):")
-for label, counts in sorted(per_label_counts.items()):
-    rating_value, category_value = label
-    print(
-        f"[{rating_value} | {category_value}] -> support={counts['support']}, "
-        f"tp={counts['tp']}, fp={counts['fp']}, fn={counts['fn']}"
-    )
+print("\nCategory metrics")
+print(f"Accuracy : {category_accuracy:.4f}")
+print(f"Precision: {category_precision:.4f}")
+print(f"Recall   : {category_recall:.4f}")
+print(f"F1 Score : {category_f1:.4f}")
+print(f"F2 Score : {category_f2:.4f}")

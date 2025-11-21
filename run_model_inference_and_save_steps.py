@@ -14,7 +14,6 @@ from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoProcessor, LlavaOnevisionForConditionalGeneration
 from transformers.utils import logging
-from peft import LoraConfig, get_peft_model
 
 logging.set_verbosity_error()
 
@@ -40,7 +39,6 @@ TOP_P = 0.95
 TOP_K = 50
 NUM_BEAMS = 2
 SEED = 5388797                                                   # seed for deterministic sampling order
-LORA_TARGET_MODULES = ["q_proj", "v_proj", "up_proj", "down_proj"]
 
 
 # step-1: load the full test dataset to run inference on every entry
@@ -56,20 +54,7 @@ print(f"Loaded {len(test_entries)} test entries from {TEST_DATASET_PATH}.")
 # step-2: initialize processor and model, then optionally load fine-tuned weights
 processor = AutoProcessor.from_pretrained(MODEL_BASE)
 config = AutoConfig.from_pretrained(MODEL_BASE)
-base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
-
-if APPLY_LORA:
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=LORA_TARGET_MODULES,
-    )
-    model = get_peft_model(base_model, lora_config)
-else:
-    model = base_model
+model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
 
 if STATE_DICT_PATH and Path(STATE_DICT_PATH).exists():
     print(f"Loading fine-tuned weights from {STATE_DICT_PATH}...")
