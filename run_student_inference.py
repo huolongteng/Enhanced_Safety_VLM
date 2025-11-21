@@ -5,22 +5,23 @@ import random
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
 from PIL import Image
 from transformers import AutoConfig, AutoProcessor, LlavaOnevisionForConditionalGeneration
 from transformers.utils import logging
+from peft import LoraConfig, get_peft_model
 
 logging.set_verbosity_error()
 
 # step-0: set runtime variables instead of command-line arguments (for running in IDEs like PyCharm)
 MODEL_BASE = "E:/models/llava-onevision-qwen2-0.5b-ov-hf"  # path to the base model checkpoint
-STATE_DICT_PATH = "outputs-1141/model.safetensors"          # path to the fine-tuned student weights (.safetensors)
+STATE_DICT_PATH = "outputs-1118/best_model_state.pt"       # path to the fine-tuned student weights (.pt)
 TEST_DIR = "data/test"                                      # folder containing test JPG images
 POLICY_PATH = "policy.json"                                 # JSON file with a 'policies' list
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"  # computation device
 SEED = 5388797                                                   # random seed for sampling an image
-MAX_NEW_TOKENS = 512
-TEST_DATASET_PATH = 'data/test_dataset.json'# generation length
+MAX_NEW_TOKENS = 512                                              # generation length
+TEST_DATASET_PATH = "data/test_dataset.json"
+LORA_TARGET_MODULES = ["q_proj", "v_proj", "up_proj", "down_proj"]
 
 # step-1: load the test dataset entries
 TEST_DATASET_FILE = Path(TEST_DATASET_PATH)
@@ -60,9 +61,18 @@ prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
 
 # step-4: initialize the model from config and load the fine-tuned state dict
 config = AutoConfig.from_pretrained(MODEL_BASE)
-model = LlavaOnevisionForConditionalGeneration(config)
-state_dict = load_file(STATE_DICT_PATH, device="cpu")
-model.load_state_dict(state_dict, strict=False)
+base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(MODEL_BASE, config=config)
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=LORA_TARGET_MODULES,
+)
+model = get_peft_model(base_model, lora_config)
+state_dict = torch.load(STATE_DICT_PATH, map_location="cpu")
+model.load_state_dict(state_dict, strict=True)
 model.eval()
 
 # step-5: prepare the image and text inputs, then move everything to the target device
